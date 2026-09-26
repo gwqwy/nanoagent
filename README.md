@@ -35,7 +35,10 @@
 ## 快速开始
 
 ```cmd
-:: 1. 安装依赖（项目根目录已有 .venv 可跳过创建）
+:: 1. 安装（二选一）
+::    a) 直接从 GitHub 安装
+pip install "git+https://github.com/gwqwy/nanoagent.git"
+::    b) 本地开发安装（项目根目录已有 .venv 可跳过创建）
 py -3.14 -m venv .venv
 .venv\Scripts\python -m pip install -e .[server]
 
