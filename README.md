@@ -1,5 +1,7 @@
 # nanoagent
 
+[![CI](https://github.com/gwqwy/nanoagent/actions/workflows/ci.yml/badge.svg)](https://github.com/gwqwy/nanoagent/actions/workflows/ci.yml)
+
 从零实现的轻量级 Python Agent 框架。设计参考 [Agno](https://github.com/agno-agi/agno)（轻量、agent 即库）、
 [OpenAI Agents SDK](https://github.com/openai/openai-agents-python)（极简循环与 handoff）与
 [LangGraph](https://github.com/langchain-ai/langgraph)（可观测性）的思想，但全部代码手写、依赖极少、
