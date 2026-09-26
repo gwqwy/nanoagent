@@ -1,0 +1,43 @@
+[project]
+name = "nanoagent"
+version = "0.1.0"
+description = "从零实现的轻量级 Python Agent 框架：agent loop + 工具调用 + 记忆 + RAG + 多 agent 编排"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.30",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+faiss = [
+    "faiss-cpu>=1.8",
+]
+mcp = [
+    "mcp>=2.0",
+]
+tiktoken = [
+    "tiktoken>=0.7",
+]
+otel = [
+    "opentelemetry-sdk>=1.20",
+]
+postgres = [
+    "psycopg[binary]>=3.1",
+]
+browser = [
+    "playwright>=1.40",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["nanoagent*"]

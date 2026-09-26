@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# 构建产物
+build/
+dist/
+
+# 本地环境与密钥（含明文 API Key，禁止入库）
+.env
+.env.local
+
+# 运行时产物
+*.log
+*.db
+.nanoagent/

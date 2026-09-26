@@ -1,0 +1,248 @@
+"""会话记忆：多会话消息存储、滑动窗口/token 双维裁剪、JSON 文件持久化。"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# 视觉模型对每张图片的计费上限（DeepSeek 实测值），用于估算多模态消息
+IMAGE_TOKEN_ESTIMATE = 1024
+
+
+def estimate_tokens(text: str) -> int:
+    """token 估算：装有 tiktoken 时用 cl100k_base 精确计数，否则零依赖启发式
+    （ASCII 约 4 字符/token，CJK 等全角字符约 1 字符/token）。
+
+    用途是窗口裁剪的触发依据，不追求计费级精确。
+    """
+    if not text:
+        return 0
+    global _TIKTOKEN_ENCODER
+    if _TIKTOKEN_ENCODER is not False:  # None=未尝试，False=不可用
+        try:
+            if _TIKTOKEN_ENCODER is None:
+                import tiktoken
+
+                _TIKTOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+            return len(_TIKTOKEN_ENCODER.encode(text, disallowed_special=()))
+        except Exception:  # noqa: BLE001 —— tiktoken 缺失/坏编码时回退启发式
+            _TIKTOKEN_ENCODER = False
+    wide = sum(1 for ch in text if ord(ch) > 0x2E7F)  # CJK/全角区
+    return (len(text) - wide + 3) // 4 + wide
+
+
+_TIKTOKEN_ENCODER: Any = None  # None=未尝试；False=不可用；否则为编码器
+
+
+def message_tokens(content) -> int:
+    """估算一条消息的 token 数；content 为多模态数组时按文本+图片上限计。"""
+    if isinstance(content, str):
+        return estimate_tokens(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                total += estimate_tokens(part.get("text", ""))
+            elif isinstance(part, dict) and part.get("type") == "image_url":
+                total += IMAGE_TOKEN_ESTIMATE
+        return total
+    return estimate_tokens(str(content))
+
+
+class Memory:
+    """按 session_id 组织的对话历史，可按条数与 token 双维限窗并持久化到磁盘。"""
+
+    def __init__(
+        self,
+        max_messages: int | None = None,
+        max_tokens: int | None = None,
+        persist_path: str | Path | None = None,
+    ):
+        if max_messages is not None and max_messages < 1:
+            raise ValueError("max_messages 必须 >= 1")
+        if max_tokens is not None and max_tokens < 1:
+            raise ValueError("max_tokens 必须 >= 1")
+        self.max_messages = max_messages
+        self.max_tokens = max_tokens
+        self.persist_path = Path(persist_path) if persist_path else None
+        self._sessions: Dict[str, List[dict]] = {}
+        if self.persist_path and self.persist_path.exists():
+            self._load()
+
+    # ------------------------------------------------------------------
+    def _over_limit(self, history: List[dict]) -> bool:
+        if self.max_messages and len(history) > self.max_messages:
+            return True
+        if self.max_tokens and self._history_tokens(history) > self.max_tokens:
+            return True
+        return False
+
+    def _history_tokens(self, history: List[dict]) -> int:
+        return sum(message_tokens(m.get("content", "")) for m in history)
+
+    def add(self, session_id: str, role: str, content) -> None:
+        """追加一条消息，超过条数/token 任一上限时调用 _trim 裁剪。"""
+        history = self._sessions.setdefault(session_id, [])
+        history.append(
+            {"role": role, "content": content, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+        )
+        if self._over_limit(history):
+            self._trim(session_id, history)
+
+    def _trim(self, session_id: str, history: List[dict]) -> None:
+        """超窗时的裁剪策略：从最旧开始丢，直到条数与 token 都回到限内。
+
+        子类可覆盖（如 SummaryMemory 改为压缩）。单条消息自身超 token 上限时
+        也会被裁掉（此时该会话历史可能为空，由调用方决定是否继续写入）。
+        """
+        while history and self._over_limit(history):
+            del history[0]
+
+    def tokens(self, session_id: str) -> int:
+        """返回指定会话当前历史的估算 token 总数。"""
+        return self._history_tokens(self._sessions.get(session_id, []))
+
+    def history(self, session_id: str) -> List[dict]:
+        """返回指定会话的消息副本（去掉内部时间戳字段）。"""
+        return [{"role": m["role"], "content": m["content"]} for m in self._sessions.get(session_id, [])]
+
+    def clear(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+    def sessions(self) -> List[str]:
+        return list(self._sessions)
+
+    # ------------------------------------------------------------------
+    def save(self) -> Optional[Path]:
+        """把全部会话写入 JSON 文件，返回文件路径；未配置持久化路径时返回 None。"""
+        if not self.persist_path:
+            return None
+        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        self.persist_path.write_text(
+            json.dumps(self._sessions, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return self.persist_path
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.persist_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        if isinstance(data, dict):
+            self._sessions = {
+                sid: [m for m in msgs if isinstance(m, dict) and "role" in m and "content" in m]
+                for sid, msgs in data.items()
+                if isinstance(msgs, list)
+            }
+
+
+class SummaryMemory(Memory):
+    """带自动摘要的记忆：超窗的旧消息先经 LLM 压缩成摘要，而不是直接丢弃。
+
+    工作方式（惰性触发，add 时压缩）：
+        - 历史超过 max_messages（条数）或 max_tokens（token 估算，自动压缩触发器）
+          时，把最旧的若干条连同旧摘要一起交给 LLM 生成新摘要
+        - history() 返回：[摘要 system 消息] + 最近 keep_recent 条消息
+    Agent 侧无需任何改动，它只依赖 history()。
+    """
+
+    DEFAULT_SUMMARY_PROMPT = (
+        "请把以下对话记录压缩成一份要点摘要（中文，300 字以内），"
+        "保留用户的关键信息、明确的事实与已达成的结论，去掉寒暄与重复。\n\n对话记录：\n{transcript}"
+    )
+
+    def __init__(
+        self,
+        max_messages: int = 20,
+        keep_recent: int = 6,
+        max_tokens: int | None = None,
+        llm=None,
+        summary_prompt: str | None = None,
+        persist_path: str | Path | None = None,
+    ):
+        """初始化。注意 super().__init__ 会触发 _load，因此 _summaries 必须先初始化。"""
+        if keep_recent < 1:
+            raise ValueError("keep_recent 必须 >= 1")
+        if keep_recent >= max_messages:
+            raise ValueError("keep_recent 必须小于 max_messages，否则永远不触发压缩")
+        self.keep_recent = keep_recent
+        self._summaries: Dict[str, str] = {}
+        super().__init__(max_messages=max_messages, max_tokens=max_tokens, persist_path=persist_path)
+        self.llm = llm  # 惰性创建，避免仅用 Memory 时就要求能连上模型服务
+        self.summary_prompt = summary_prompt or self.DEFAULT_SUMMARY_PROMPT
+
+    # ------------------------------------------------------------------
+    def _trim(self, session_id: str, history: List[dict]) -> None:
+        """覆盖父类的滑窗裁剪：把被裁掉的旧消息压缩进摘要而不是丢弃。
+
+        可压缩消息不足 keep_recent 时跳过（token 触发但无旧消息可压，
+        避免一次无效的 LLM 调用）。
+        """
+        if len(history) > self.keep_recent:
+            self._compress(session_id, history)
+
+    def _compress(self, session_id: str, history: List[dict]) -> None:
+        """把超窗的旧消息压缩进摘要，只保留最近 keep_recent 条。"""
+        evicted = history[: len(history) - self.keep_recent]
+        history[:] = history[-self.keep_recent :]
+
+        transcript = "\n".join(f"{m['role']}: {m['content']}" for m in evicted)
+        if self._summaries.get(session_id):
+            transcript = f"已有摘要：\n{self._summaries[session_id]}\n\n新增对话：\n{transcript}"
+        prompt = self.summary_prompt.format(transcript=transcript)
+        self._summaries[session_id] = self._summarize(prompt).strip()
+
+    def _summarize(self, prompt: str) -> str:
+        if self.llm is None:
+            from .llm import LLM
+
+            self.llm = LLM()
+        return self.llm.chat([{"role": "user", "content": prompt}]).content
+
+    # ------------------------------------------------------------------
+    def history(self, session_id: str) -> List[dict]:
+        """返回 [摘要] + 最近消息；摘要以 system 角色注入历史开头。"""
+        messages = super().history(session_id)
+        summary = self._summaries.get(session_id)
+        if summary:
+            messages.insert(0, {"role": "system", "content": f"以下是此前对话的摘要：{summary}"})
+        return messages
+
+    def summary(self, session_id: str) -> str:
+        """返回指定会话的当前摘要（无则空串）。"""
+        return self._summaries.get(session_id, "")
+
+    def clear(self, session_id: str) -> None:
+        super().clear(session_id)
+        self._summaries.pop(session_id, None)
+
+    # ------------------------------------------------------------------
+    def save(self) -> Optional[Path]:
+        if not self.persist_path:
+            return None
+        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sessions": self._sessions,
+            "summaries": self._summaries,
+        }
+        self.persist_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return self.persist_path
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.persist_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        if isinstance(data, dict) and "sessions" in data:
+            self._summaries = dict(data.get("summaries") or {})
+            data = data["sessions"]
+        if isinstance(data, dict):
+            self._sessions = {
+                sid: [m for m in msgs if isinstance(m, dict) and "role" in m and "content" in m]
+                for sid, msgs in data.items()
+                if isinstance(msgs, list)
+            }
