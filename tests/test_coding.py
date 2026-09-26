@@ -297,6 +297,23 @@ class AgentIntegrationTests(unittest.TestCase):
         names = {t.name for t in ws.as_tools()}
         self.assertEqual(names, {"read_file", "write_file"})
 
+    def test_allowed_tools_empty_set_means_zero_tools(self):
+        """审计 N-08：allowed_tools=set() 是显式「零工具」沙箱，不能落到全量放行。
+
+        旧行为 `self.allowed_tools or set(all_tools)` 把空集合当 falsy，
+        传 set() 反而暴露全部 15 个工具（含 delete_file / run_command）。
+        """
+        ws = make_ws(auto_approve=True, allowed_tools=set())
+        self.addCleanup(ws._tmp.cleanup)
+        self.assertEqual(ws.as_tools(), [])
+
+    def test_allowed_tools_unknown_name_raises(self):
+        """白名单含未知工具名时显式报错，而不是静默产出空工具集。"""
+        ws = make_ws(auto_approve=True, allowed_tools={"no_such_tool"})
+        self.addCleanup(ws._tmp.cleanup)
+        with self.assertRaises(ValueError):
+            ws.as_tools()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -130,7 +130,12 @@ def cmd_install_mcp(args: argparse.Namespace) -> int:
 
 
 def cmd_remove_plugin(args: argparse.Namespace) -> int:
-    target = Path(args.config) / "plugins" / args.name
+    # 审计 N-10a：args.name 之前无任何校验，"../victim" 这类输入会 rmtree
+    # 到 plugins 目录之外。目标必须 resolve 后仍落在 plugins 目录内。
+    plugins_root = (Path(args.config) / "plugins").resolve()
+    target = (plugins_root / args.name).resolve()
+    if target == plugins_root or not target.is_relative_to(plugins_root):
+        raise SystemExit(f"非法插件名（越出插件目录）: {args.name}")
     if not target.is_dir():
         raise SystemExit(f"插件不存在: {target}")
     shutil.rmtree(target)

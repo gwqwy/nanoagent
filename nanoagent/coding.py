@@ -507,7 +507,15 @@ class CodingWorkspace:
             "read_process": self.read_process, "stop_process": self.stop_process,
             "spawn_subagent": self.spawn_subagent,
         }
-        names = self.allowed_tools or set(all_tools)
+        # 注意 None 与空集合语义不同（审计 N-08）：
+        #   None（默认）→ 暴露全部工具；
+        #   空集合 → 一个工具都不暴露（用户显式传 set() 是想做"零工具"沙箱，
+        #   旧行为 `or set(all_tools)` 把它当 falsy 落到全量放行，安全语义反转）。
+        names = set(all_tools) if self.allowed_tools is None else set(self.allowed_tools)
+        unknown = names - set(all_tools)
+        if unknown:
+            raise ValueError(f"allowed_tools 含未知工具名: {sorted(unknown)}；"
+                             f"可用: {sorted(all_tools)}")
         return [make_tool(all_tools[name]) for name in all_tools if name in names]
 
 

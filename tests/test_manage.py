@@ -48,3 +48,42 @@ class RemoveSkillTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemovePluginTests(unittest.TestCase):
+    """审计 N-10a：remove-plugin 的 name 不得越出 plugins 目录。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.config = Path(self._tmp.name)
+        self.plugins = self.config / "plugins"
+        self.plugins.mkdir(parents=True)
+        victim = self.config / "victim"
+        victim.mkdir()
+        (victim / "keep.txt").write_text("宝贵数据", encoding="utf-8")
+        self.victim = victim
+
+    def test_removes_legitimate_plugin(self):
+        plugin = self.plugins / "demo"
+        plugin.mkdir()
+        (plugin / "x.txt").write_text("x", encoding="utf-8")
+        rc = manage.cmd_remove_plugin(_ns(str(self.config), "demo"))
+        self.assertEqual(rc, 0)
+        self.assertFalse(plugin.exists())
+
+    def test_rejects_traversal_name(self):
+        with self.assertRaises(SystemExit):
+            manage.cmd_remove_plugin(_ns(str(self.config), "../victim"))
+        self.assertTrue(self.victim.exists())  # plugins 外目录完好
+
+    def test_rejects_dotdot_and_root(self):
+        with self.assertRaises(SystemExit):
+            manage.cmd_remove_plugin(_ns(str(self.config), ".."))
+        with self.assertRaises(SystemExit):
+            manage.cmd_remove_plugin(_ns(str(self.config), "."))
+        self.assertTrue(self.plugins.exists())
+
+    def test_rejects_missing_plugin(self):
+        with self.assertRaises(SystemExit):
+            manage.cmd_remove_plugin(_ns(str(self.config), "no-such"))
