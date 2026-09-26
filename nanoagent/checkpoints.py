@@ -14,10 +14,29 @@ Postgres/Redis 等按同一协议实现 save/load/delete/list 即可接入。
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+    """原子写 JSON：临时文件 + fsync + os.replace，避免半写文件被读到。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 class CheckpointBackend(Protocol):
@@ -49,7 +68,14 @@ class InMemoryBackend:
 
 
 class JsonFileBackend:
-    """JSON 文件后端。path 指向目录（每个 key 一个文件）或 .json 文件（固定单文件）。"""
+    """JSON 文件后端。path 指向目录（每个 key 一个文件）或 .json 文件（固定单文件）。
+
+    固定单文件模式下，多个逻辑 key 会共存于同一文件的一个信封里
+    （旧实现直接整文件覆盖，导致 `load("task")` 读到 workflow 的内容）。
+    读取时兼容历史上的「整文件即单个 state」旧格式。
+    """
+
+    ENVELOPE = "__nanoagent_checkpoints__"
 
     def __init__(self, path: str | Path = ".nanoagent/checkpoints"):
         self.path = Path(path)
@@ -65,21 +91,62 @@ class JsonFileBackend:
         safe = key.replace("/", "_").replace("\\", "_")
         return self.path / f"{safe}.json"
 
+    def _read_file(self) -> Dict[str, Any]:
+        """读取固定文件的信封；不存在/损坏时返回空信封。"""
+        if not self.path.is_file():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if isinstance(data, dict) and isinstance(data.get(self.ENVELOPE), dict):
+            return dict(data[self.ENVELOPE])
+        # 旧格式：整文件就是某个 key 的 state
+        return {"__legacy__": data}
+
     def save(self, key: str, state: Dict[str, Any]) -> None:
-        self._path(key).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        target = self._path(key)
+        if not self.fixed_file:
+            _atomic_write_json(target, state)
+            return
+        envelope = self._read_file()
+        envelope.pop("__legacy__", None)   # 写入信封格式后不再保留旧格式
+        envelope[key] = state
+        _atomic_write_json(target, {self.ENVELOPE: envelope})
 
     def load(self, key: str) -> Optional[Dict[str, Any]]:
         path = self._path(key)
         if not path.is_file():
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        if not self.fixed_file:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return None
+        envelope = self._read_file()
+        if key in envelope:
+            return envelope[key]
+        if "__legacy__" in envelope:
+            return envelope["__legacy__"]   # 兼容旧文件
+        return None
 
     def delete(self, key: str) -> None:
-        self._path(key).unlink(missing_ok=True)
+        if not self.fixed_file:
+            self._path(key).unlink(missing_ok=True)
+            return
+        envelope = self._read_file()
+        envelope.pop(key, None)
+        if envelope:
+            _atomic_write_json(self.path, {self.ENVELOPE: envelope})
+        else:
+            self.path.unlink(missing_ok=True)
 
     def keys(self) -> List[str]:
         if self.fixed_file:
-            return [self.path.stem] if self.path.is_file() else []
+            if not self.path.is_file():
+                return []
+            envelope = self._read_file()
+            return sorted(k for k in envelope if k != "__legacy__")
         return sorted(p.stem for p in self.path.glob("*.json"))
 
 

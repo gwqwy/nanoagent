@@ -166,7 +166,10 @@ class CheckpointTests(unittest.TestCase):
             ], checkpoint=path)
             runner.run("目标")
 
-            state = json.loads(Path(path).read_text(encoding="utf-8"))
+            # 固定单文件后端现在用信封把多个逻辑 key 分开存放，经后端接口读取
+            from nanoagent.checkpoints import JsonFileBackend
+
+            state = JsonFileBackend(path).load("task")
             self.assertEqual(state["goal"], "目标")
             self.assertEqual(len(state["items"]), 2)
             self.assertEqual([i["status"] for i in state["items"]], ["done", "done"])

@@ -67,6 +67,7 @@ class CodingWorkspace:
         self._process_logs: Dict[int, Path] = {}
         self._process_files: Dict[int, Any] = {}
         self._next_pid = 1
+        self._next_subagent_id = 1  # N-17：子代理会话编号与后台进程 pid 分开计数
 
     # ------------------------------------------------------------------
     def _safe_path(self, path: str | Path, *, must_exist: bool = False) -> Path:
@@ -92,6 +93,29 @@ class CodingWorkspace:
         except ValueError:
             return str(path)
 
+    def _glob_paths(self, pattern: str) -> List[Path]:
+        """受约束的 glob：模式与命中项都不得越出工作区。
+
+        安全说明：``Path.glob`` 会把 ``..`` 当作可展开分量，因此 ``self.root.glob("../*")``
+        能列出工作区外的文件 —— 仅靠 ``_safe_path`` 保护单文件读写是不够的。
+        这里先拒绝模式本身的逃逸，再对每个命中项做一次 ``_safe_path`` 兜底。
+        """
+        raw = str(pattern or "").strip()
+        if not raw:
+            raise SandboxViolation("glob 模式不能为空")
+        normalized = raw.replace("\\", "/")
+        if Path(raw).is_absolute() or normalized.startswith("/"):
+            raise SandboxViolation(f"glob 模式不允许绝对路径: {pattern}")
+        if ".." in normalized.split("/"):
+            raise SandboxViolation(f"glob 模式不允许包含 '..': {pattern}")
+        safe_paths: List[Path] = []
+        for path in sorted(self.root.glob(raw)):
+            try:
+                safe_paths.append(self._safe_path(path))
+            except SandboxViolation:
+                continue
+        return safe_paths
+
     def _require_approval(self, action: str) -> Optional[str]:
         """危险操作的确认门。返回 None 表示放行，返回字符串表示拒绝（含理由）。"""
         if self.auto_approve:
@@ -112,6 +136,39 @@ class CodingWorkspace:
             return text
         return text[:limit] + f"\n...（输出过长，已截断，共 {len(text)} 字符）"
 
+    @staticmethod
+    def _as_int(value: Any, default: int) -> int:
+        """宽容地把模型传来的参数转成 int。
+
+        模型即使拿到正确的 schema 也可能把数字写成字符串（"10"）；
+        旧实现在这种输入下会直接 `TypeError: unsupported operand type(s) for -`。
+        """
+        if isinstance(value, bool) or value is None or value == "":
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return default
+
+    @staticmethod
+    def _as_bool(value: Any, default: bool = False) -> bool:
+        """宽容地解析布尔参数（"true"/"1"/"yes" 等字符串形式）。"""
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("true", "1", "yes", "y", "on"):
+            return True
+        if text in ("false", "0", "no", "n", "off"):
+            return False
+        return default
+
     # ------------------------------------------------------------------
     # 文件工具
     # ------------------------------------------------------------------
@@ -125,6 +182,8 @@ class CodingWorkspace:
         """
         resolved = self._safe_path(path, must_exist=True)
         lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+        start_line = self._as_int(start_line, 0)
+        end_line = self._as_int(end_line, 0)
         start = max(start_line - 1, 0) if start_line else 0
         end = end_line if end_line else len(lines)
         selected = lines[start:end]
@@ -155,6 +214,7 @@ class CodingWorkspace:
             replace_all: 命中多处时是否全部替换
         """
         resolved = self._safe_path(path, must_exist=True)
+        replace_all = self._as_bool(replace_all)
         source = resolved.read_text(encoding="utf-8")
         count = source.count(old_text)
         if count == 0:
@@ -207,8 +267,12 @@ class CodingWorkspace:
         Args:
             pattern: glob 模式，如 **/*.py 或 src/*.md
         """
+        try:
+            paths = self._glob_paths(pattern)
+        except SandboxViolation as exc:
+            return f"错误：{exc}"
         matches = []
-        for path in sorted(self.root.glob(pattern)):
+        for path in paths:
             if not path.is_file():
                 continue
             if any(part in self.ignores for part in path.parts):
@@ -229,9 +293,13 @@ class CodingWorkspace:
             regex = _re.compile(query)
         except _re.error as exc:
             return f"错误：正则不合法: {exc}"
+        try:
+            paths = self._glob_paths(pattern)
+        except SandboxViolation as exc:
+            return f"错误：{exc}"
 
         hits: List[str] = []
-        for path in sorted(self.root.glob(pattern)):
+        for path in paths:
             if not path.is_file() or any(part in self.ignores for part in path.parts):
                 continue
             try:
@@ -258,6 +326,7 @@ class CodingWorkspace:
         blocked = self._require_approval(f"run_command: {command}")
         if blocked:
             return blocked
+        timeout = max(1, self._as_int(timeout, 60))
         try:
             completed = subprocess.run(
                 command, shell=True, cwd=str(self.root),
@@ -352,14 +421,27 @@ class CodingWorkspace:
             process_id: start_process 返回的进程编号
             tail_lines: 最多返回的行数
         """
+        process_id = self._as_int(process_id, -1)
+        tail_lines = max(1, self._as_int(tail_lines, 50))
         process = self._processes.get(process_id)
         if process is None:
             return f"错误：不存在后台进程 #{process_id}"
         log_path = self._process_logs[process_id]
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines() if log_path.is_file() else []
         status = "运行中" if process.poll() is None else f"已退出（exit {process.returncode}）"
+        if process.poll() is not None:
+            self._release_process_log(process_id)   # 进程已自然退出：顺手关闭日志句柄
         tail = "\n".join(lines[-tail_lines:])
         return f"进程 #{process_id} [{status}]\n{self._truncate(tail) or '（尚无输出）'}"
+
+    def _release_process_log(self, process_id: int) -> None:
+        """关闭并移除后台进程的日志句柄（进程自然退出时也要回收，避免句柄泄漏）。"""
+        handle = self._process_files.pop(process_id, None)
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
 
     def stop_process(self, process_id: int) -> str:
         """终止一个后台进程（危险操作，需确认门放行）。
@@ -367,6 +449,7 @@ class CodingWorkspace:
         Args:
             process_id: start_process 返回的进程编号
         """
+        process_id = self._as_int(process_id, -1)
         process = self._processes.get(process_id)
         if process is None:
             return f"错误：不存在后台进程 #{process_id}"
@@ -383,9 +466,7 @@ class CodingWorkspace:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
-        log_file = self._process_files.pop(process_id, None)
-        if log_file is not None:
-            log_file.close()
+        self._release_process_log(process_id)
         return f"后台进程 #{process_id} 已终止"
 
     # ------------------------------------------------------------------
@@ -404,8 +485,9 @@ class CodingWorkspace:
                 "工厂接收 instructions 返回配置好工具的 Agent。"
             )
         agent = self.agent_factory(instructions)
-        session_id = f"subagent-{self._next_pid}"
-        self._next_pid += 1
+        # N-17：用独立计数器，避免子代理编号与后台进程 pid 混用造成观感冲突
+        session_id = f"subagent-{self._next_subagent_id}"
+        self._next_subagent_id += 1
         result = agent.run(task, session_id=session_id)
         return result.content
 

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -24,7 +25,12 @@ MAX_TEXT_CHARS = 6000
 
 
 class BrowserWorkspace:
-    """一个受控浏览器会话。所有工具操作同一个页面（懒启动）。"""
+    """一个受控浏览器会话。所有工具操作同一个页面（懒启动）。
+
+    注意：Playwright 的**同步 API 绑定到创建它的线程**（内部用 greenlet 驱动），
+    因此本工作区的工具全部标记 thread_safe=False，Agent 遇到它们会退化为串行执行，
+    不会把调用丢进线程池。
+    """
 
     def __init__(self, *, headless: bool = True, allowed_tools: Optional[set] = None):
         self.headless = headless
@@ -32,19 +38,30 @@ class BrowserWorkspace:
         self._playwright: Any = None
         self._browser: Any = None
         self._page: Any = None
+        self._lock = threading.RLock()
+        self._owner_thread: Optional[int] = None
 
     def _ensure_page(self) -> Any:
-        if self._page is None:
-            try:
-                from playwright.sync_api import sync_playwright
-            except ImportError as exc:
-                raise ImportError(
-                    "浏览器工具需要先安装: pip install nanoagent[browser] && playwright install chromium"
-                ) from exc
-            self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=self.headless)
-            self._page = self._browser.new_page()
-        return self._page
+        with self._lock:
+            if self._owner_thread is None:
+                self._owner_thread = threading.get_ident()
+            elif self._owner_thread != threading.get_ident():
+                raise RuntimeError(
+                    "Playwright 同步 API 只能在创建浏览器的线程中使用"
+                    f"（创建于线程 {self._owner_thread}，当前线程 {threading.get_ident()}）。"
+                    "请把浏览器工具标记为串行执行，或改用异步 API。"
+                )
+            if self._page is None:
+                try:
+                    from playwright.sync_api import sync_playwright
+                except ImportError as exc:
+                    raise ImportError(
+                        "浏览器工具需要先安装: pip install nanoagent[browser] && playwright install chromium"
+                    ) from exc
+                self._playwright = sync_playwright().start()
+                self._browser = self._playwright.chromium.launch(headless=self.headless)
+                self._page = self._browser.new_page()
+            return self._page
 
     # ------------------------------------------------------------------
     def navigate(self, url: str) -> str:
@@ -112,7 +129,8 @@ class BrowserWorkspace:
             "screenshot": self.screenshot, "get_url": self.get_url,
         }
         names = self.allowed_tools or set(all_tools)
-        return [make_tool(all_tools[name]) for name in all_tools if name in names]
+        # thread_safe=False：Playwright 同步 API 不能跨线程调用
+        return [make_tool(all_tools[name], thread_safe=False) for name in all_tools if name in names]
 
     def close(self) -> None:
         """关闭浏览器并释放 Playwright 资源。"""

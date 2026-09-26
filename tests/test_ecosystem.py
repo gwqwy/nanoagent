@@ -179,7 +179,9 @@ class CheckpointWiringTests(unittest.TestCase):
             ])), checkpoint=path)
             result = runner.run("目标")
             self.assertTrue(result.all_done)
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["goal"], "目标")
+            from nanoagent.checkpoints import JsonFileBackend
+
+            self.assertEqual(JsonFileBackend(path).load("task")["goal"], "目标")
 
 
 class ReplanningTests(unittest.TestCase):

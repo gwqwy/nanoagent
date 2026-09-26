@@ -77,6 +77,7 @@ class Agent:
         response_model: type[BaseModel] | None = None,
         input_guardrails: Optional[List[Any]] = None,
         output_guardrails: Optional[List[Any]] = None,
+        memory_tool_traces: bool = False,
     ):
         if max_iterations < 1:
             raise ValueError("max_iterations 必须 >= 1")
@@ -100,8 +101,29 @@ class Agent:
         self.max_workers = max_workers
         self.response_model = response_model
         self.guardrails = Guardrails(input_guardrails, output_guardrails)
+        # N-22：默认只把 user/最终回答写进记忆（保持既有语义）。开启后额外把本轮
+        # 工具调用与结果以可读文本追加进记忆，多轮对话中模型能看到上一轮的工具交互。
+        self.memory_tool_traces = memory_tool_traces
         self.skills = None  # enable_skills 后为 SkillRegistry
         self._skills_marker = "# 可用技能"
+
+    # ------------------------------------------------------------------
+    def _record_turn(
+        self, session_id: str, user_input: str, final_content: str, tool_log: List[dict]
+    ) -> None:
+        """把一轮对话写入记忆（N-22：可选附带工具调用轨迹）。"""
+        self.memory.add(session_id, "user", user_input)
+        if self.memory_tool_traces and tool_log:
+            self.memory.add(session_id, "assistant", self._format_tool_trace(tool_log))
+        self.memory.add(session_id, "assistant", final_content)
+
+    @staticmethod
+    def _format_tool_trace(tool_log: List[dict]) -> str:
+        lines = ["[工具调用记录]"]
+        for record in tool_log:
+            args = json.dumps(record.get("arguments", {}), ensure_ascii=False)
+            lines.append(f"- {record.get('name')}({args}) => {record.get('result')}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     def _guard_input(self, user_input: str) -> str:
@@ -174,13 +196,22 @@ class Agent:
         """执行一轮工具调用，返回与 tool_calls 等长的结果列表（顺序一致）。
 
         列表元素形如 {name, arguments, result}；并/串行两条路径共用此方法。
+        只要本轮出现线程不安全工具（Playwright 同步 API、绑定事件循环的 MCP 会话等），
+        就整体退化为串行 —— 否则它们会在其它线程里崩溃。
         """
         if len(tool_calls) == 1 or not self.parallel_tools:
+            return [self._execute_one(tc) for tc in tool_calls]
+        if any(not self._tool_thread_safe(tc.name) for tc in tool_calls):
             return [self._execute_one(tc) for tc in tool_calls]
 
         with ThreadPoolExecutor(max_workers=min(self.max_workers, len(tool_calls))) as pool:
             futures = [pool.submit(self._execute_one, tc) for tc in tool_calls]
             return [future.result() for future in futures]  # 按提交顺序取回，保证确定性
+
+    def _tool_thread_safe(self, name: str) -> bool:
+        """查询工具是否可跨线程调用；未注册的工具按安全处理（会由 execute 报错）。"""
+        tool = self.tools.get(name)
+        return True if tool is None else bool(getattr(tool, "thread_safe", True))
 
     def _execute_one(self, tool_call: ToolCall) -> dict:
         started = time.perf_counter()
@@ -256,6 +287,7 @@ class Agent:
         final_content = ""
         reasoning_parts: List[str] = []
         iterations = 0
+        output = None
 
         try:
             for i in range(self.max_iterations):
@@ -294,31 +326,31 @@ class Agent:
                 final_content = response.content
                 messages.append({"role": "assistant", "content": final_content})
             self._guard_output(final_content)
+
+            # 结构化输出放在 try 内，保证 structure_retry/failed 事件仍带 run_id
+            # （与 arun 一致；原先在 finally 之后写，run_id 已置 None 而丢失归属）
+            if self.response_model is not None:
+                error = None
+                for attempt in range(2):
+                    try:
+                        output = self._try_parse_output(final_content)
+                        break
+                    except Exception as exc:  # noqa: BLE001 —— 解析/校验失败回填模型重试一次
+                        error = f"{type(exc).__name__}: {exc}"
+                        if attempt == 0:
+                            self.tracer.log("structure_retry", error=error)
+                            messages.extend(self._structure_prompt(final_content, error))
+                            retry = self.llm.chat(messages)
+                            final_content = retry.content
+                            messages.append({"role": "assistant", "content": final_content})
+                if output is None:
+                    self.tracer.log("structure_failed", error=error)
+                    raise OutputValidationError(f"结构化输出在重试后仍失败，最后一次错误: {error}")
         finally:
             self.tracer.end_run(iterations=iterations)
 
-        output = None
-        if self.response_model is not None:
-            error = None
-            for attempt in range(2):
-                try:
-                    output = self._try_parse_output(final_content)
-                    break
-                except Exception as exc:  # noqa: BLE001 —— 解析/校验失败回填模型重试一次
-                    error = f"{type(exc).__name__}: {exc}"
-                    if attempt == 0:
-                        self.tracer.log("structure_retry", error=error)
-                        messages.extend(self._structure_prompt(final_content, error))
-                        retry = self.llm.chat(messages)
-                        final_content = retry.content
-                        messages.append({"role": "assistant", "content": final_content})
-            if output is None:
-                self.tracer.log("structure_failed", error=error)
-                raise OutputValidationError(f"结构化输出在重试后仍失败，最后一次错误: {error}")
-
         if save:
-            self.memory.add(session_id, "user", user_input)
-            self.memory.add(session_id, "assistant", final_content)
+            self._record_turn(session_id, user_input, final_content, tool_log)
         return AgentResult(
             content=final_content,
             tool_calls=tool_log,
@@ -347,7 +379,9 @@ class Agent:
         user_input = self._guard_input(user_input)
         messages = self._build_messages(user_input, session_id, images, image_detail)
         tool_log: List[dict] = []
+        usage_total: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         final_content = ""
+        reasoning_parts: List[str] = []
         iterations = 0
 
         try:
@@ -359,12 +393,17 @@ class Agent:
                     parts.append(text)
                     yield {"type": "delta", "text": text}
                 response = stream.response or LLMResponse(content="".join(parts))
+                for key in usage_total:
+                    usage_total[key] += response.usage.get(key, 0)
+                if getattr(response, "reasoning", ""):
+                    reasoning_parts.append(response.reasoning)
                 self.tracer.log(
                     "llm_call",
                     iteration=iterations,
                     content=response.content,
                     reasoning=getattr(response, "reasoning", ""),
                     tool_calls=[(tc.name, tc.arguments) for tc in response.tool_calls],
+                    usage=response.usage,
                 )
 
                 if not response.has_tool_calls:
@@ -396,9 +435,14 @@ class Agent:
             self.tracer.end_run(iterations=iterations)
 
         if save:
-            self.memory.add(session_id, "user", user_input)
-            self.memory.add(session_id, "assistant", final_content)
-        result = AgentResult(content=final_content, tool_calls=tool_log, iterations=iterations)
+            self._record_turn(session_id, user_input, final_content, tool_log)
+        result = AgentResult(
+            content=final_content,
+            tool_calls=tool_log,
+            iterations=iterations,
+            usage=usage_total,
+            reasoning="\n\n".join(reasoning_parts),
+        )
         yield {"type": "done", "result": result}
 
     # ------------------------------------------------------------------
@@ -486,8 +530,7 @@ class Agent:
             self.tracer.end_run(iterations=iterations)
 
         if save:
-            self.memory.add(session_id, "user", user_input)
-            self.memory.add(session_id, "assistant", final_content)
+            self._record_turn(session_id, user_input, final_content, tool_log)
         return AgentResult(
             content=final_content,
             tool_calls=tool_log,
@@ -512,7 +555,9 @@ class Agent:
         user_input = await self._aguard_input(user_input)
         messages = self._build_messages(user_input, session_id, images, image_detail)
         tool_log: List[dict] = []
+        usage_total: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         final_content = ""
+        reasoning_parts: List[str] = []
         iterations = 0
         output = None
 
@@ -525,12 +570,17 @@ class Agent:
                     parts.append(text)
                     yield {"type": "delta", "text": text}
                 response = stream.response or LLMResponse(content="".join(parts))
+                for key in usage_total:
+                    usage_total[key] += response.usage.get(key, 0)
+                if getattr(response, "reasoning", ""):
+                    reasoning_parts.append(response.reasoning)
                 self.tracer.log(
                     "llm_call",
                     iteration=iterations,
                     content=response.content,
                     reasoning=getattr(response, "reasoning", ""),
                     tool_calls=[(tc.name, tc.arguments) for tc in response.tool_calls],
+                    usage=response.usage,
                 )
 
                 if not response.has_tool_calls:
@@ -582,12 +632,16 @@ class Agent:
             self.tracer.end_run(iterations=iterations)
 
         if save:
-            self.memory.add(session_id, "user", user_input)
-            self.memory.add(session_id, "assistant", final_content)
+            self._record_turn(session_id, user_input, final_content, tool_log)
         yield {
             "type": "done",
             "result": AgentResult(
-                content=final_content, tool_calls=tool_log, iterations=iterations, output=output
+                content=final_content,
+                tool_calls=tool_log,
+                iterations=iterations,
+                usage=usage_total,
+                output=output,
+                reasoning="\n\n".join(reasoning_parts),
             ),
         }
 

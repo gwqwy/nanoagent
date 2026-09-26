@@ -20,6 +20,7 @@ from nanoagent.llm import LLMResponse, ToolCall
 from nanoagent.memory import Memory
 from nanoagent.multi import Pipeline, Team, Workflow
 from nanoagent.tools import tool
+from nanoagent.tracing import Tracer
 from tests.mocks import MockLLM, text_response, tool_response
 
 try:
@@ -115,6 +116,23 @@ class AsyncAgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["type"], "done")
         self.assertEqual(events[-1]["result"].content, "流式OK")
 
+    async def test_arun_stream_result_carries_usage_and_reasoning(self):
+        # N-19 回归：arun_stream 的 AgentResult 需聚合 usage / reasoning
+        agent = make_async_agent(
+            [
+                LLMResponse(
+                    content="ok",
+                    usage={"prompt_tokens": 7, "completion_tokens": 3},
+                    reasoning="思考中",
+                )
+            ]
+        )
+        events = [e async for e in agent.arun_stream("hi")]
+        result = events[-1]["result"]
+        self.assertEqual(result.usage["prompt_tokens"], 7)
+        self.assertEqual(result.usage["completion_tokens"], 3)
+        self.assertEqual(result.reasoning, "思考中")
+
     async def test_arun_requires_async_llm(self):
         agent = Agent(name="x", llm=object(), memory=Memory(), tracer=None)
         with self.assertRaises(TypeError):
@@ -184,6 +202,31 @@ class StructuredOutputTests(unittest.IsolatedAsyncioTestCase):
         result = agent.run("hi")
         self.assertEqual(result.output.title, "Sync")
 
+    async def test_sync_structure_retry_event_keeps_run_id(self):
+        # N-15 回归：同步 run 的 structure_retry 事件必须仍带 run_id
+        #（原先该逻辑写在 finally 之后，run_id 已被 end_run 置 None 而丢失归属）
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.jsonl"
+            agent = Agent(
+                name="s",
+                instructions="",
+                llm=MockLLM(
+                    [
+                        text_response("这不是 JSON"),
+                        text_response('{"title": "R", "year": 2020}'),
+                    ]
+                ),
+                memory=Memory(),
+                tracer=Tracer(path=path),
+                response_model=Movie,
+            )
+            result = agent.run("hi")
+            self.assertEqual(result.output.title, "R")
+            events = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+            retries = [e for e in events if e["event"] == "structure_retry"]
+            self.assertEqual(len(retries), 1)
+            self.assertIsNotNone(retries[0].get("run_id"))
+
     async def test_invalid_response_model_rejected(self):
         with self.assertRaises(TypeError):
             make_async_agent([], response_model=dict)
@@ -211,7 +254,9 @@ class CheckpointTests(unittest.IsolatedAsyncioTestCase):
             path = Path(tmp) / "wf.json"
             workflow = self._workflow(["FAIL 一", "PASS"], checkpoint_path=path)
             await workflow.arun("任务A")
-            state = json.loads(path.read_text(encoding="utf-8"))
+            from nanoagent.checkpoints import JsonFileBackend
+
+            state = JsonFileBackend(path).load("workflow")
             self.assertTrue(state["done"])
             self.assertTrue(state["passed"])
             self.assertEqual(state["rounds_done"], 2)
@@ -248,7 +293,9 @@ class CheckpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("缺测试", second_prompt)
 
             # checkpoint 应更新为完成态
-            state = json.loads(path.read_text(encoding="utf-8"))
+            from nanoagent.checkpoints import JsonFileBackend
+
+            state = JsonFileBackend(path).load("workflow")
             self.assertTrue(state["done"])
 
     async def test_sync_resume(self):

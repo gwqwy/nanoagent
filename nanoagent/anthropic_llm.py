@@ -32,11 +32,21 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import httpx
 
 from .config import settings
-from .llm import LLMResponse, StreamResult, ToolCall, parse_tool_arguments
+from .llm import (
+    LLMResponse,
+    StreamResult,
+    ToolCall,
+    _accumulate,
+    _with_retry,
+    parse_tool_arguments,
+)
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 REQUEST_TIMEOUT = 600.0
+DEFAULT_CONTEXT_WINDOW = 200000   # Claude 系列默认上下文窗口（token）
+MAX_RETRIES = 2
+RETRY_BACKOFF = 0.5
 
 
 # ======================================================================
@@ -259,6 +269,7 @@ class AnthropicLLM:
         api_key: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,  # Anthropic 协议必填
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
         transport: Optional[httpx.BaseTransport] = None,  # 测试注入 MockTransport
     ):
         cfg = settings()
@@ -267,6 +278,10 @@ class AnthropicLLM:
         self.api_key = api_key or cfg["api_key"] or "missing-api-key"
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # 与 OpenAI 版 LLM 对齐的公开属性：桌面端 status()/context_usage() 依赖它们，
+        # 此前本类没有这两个属性 → 用量与上下文占用恒为空（缺陷审计 H-09）。
+        self.context_window = context_window
+        self.total_usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         self._client = httpx.Client(
             timeout=REQUEST_TIMEOUT, transport=transport,
             headers=_build_headers(self.api_key),
@@ -277,14 +292,20 @@ class AnthropicLLM:
         return build_payload(self.model, self.temperature, self.max_tokens, messages, tools, stream)
 
     def _post(self, payload: dict) -> Dict[str, Any]:
-        response = self._client.post(f"{self.base_url}/v1/messages", json=payload)
+        # 与 llm.py 一致：对 429 / 5xx / 连接类错误做指数退避重试
+        response = _with_retry(
+            lambda: self._client.post(f"{self.base_url}/v1/messages", json=payload),
+            MAX_RETRIES, RETRY_BACKOFF,
+        )
         if response.status_code != 200:
             raise RuntimeError(f"Anthropic API {response.status_code}: {response.text[:500]}")
         return response.json()
 
     def chat(self, messages: list, tools: list | None = None) -> LLMResponse:
         """非流式对话，返回统一的 LLMResponse。"""
-        return from_anthropic_response(self._post(self._build_payload(messages, tools, stream=False)))
+        result = from_anthropic_response(self._post(self._build_payload(messages, tools, stream=False)))
+        _accumulate(self.total_usage, result.usage)
+        return result
 
     def chat_stream(self, messages: list, tools: list | None = None) -> StreamResult:
         """流式对话：迭代得到文本增量，迭代结束后从 result.response 取完整响应。"""
@@ -305,9 +326,21 @@ class AnthropicLLM:
                 if text:
                     yield text
         result.response = finalize_stream(state)
+        _accumulate(self.total_usage, result.response.usage)
 
     def embeddings(self, texts: List[str], model: str) -> List[List[float]]:
         raise NotImplementedError("Anthropic 协议没有 embeddings 接口，RAG 请改用 OpenAI 兼容客户端")
+
+    # ------------------------------------------------------------------
+    def close(self) -> None:
+        """关闭底层 HTTP 连接池（此前从不关闭 → 连接泄漏）。"""
+        self._client.close()
+
+    def __enter__(self) -> "AnthropicLLM":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
 
 
 class AsyncAnthropicLLM:
@@ -320,6 +353,7 @@ class AsyncAnthropicLLM:
         api_key: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         cfg = settings()
@@ -328,18 +362,40 @@ class AsyncAnthropicLLM:
         self.api_key = api_key or cfg["api_key"] or "missing-api-key"
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.context_window = context_window
+        self.total_usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0}
         self._client = httpx.AsyncClient(
             timeout=REQUEST_TIMEOUT, transport=transport,
             headers=_build_headers(self.api_key),
         )
 
     async def achat(self, messages: list, tools: list | None = None) -> LLMResponse:
-        response = await self._client.post(
-            f"{self.base_url}/v1/messages", json=self._build_payload(messages, tools, stream=False)
+        payload = self._build_payload(messages, tools, stream=False)
+        response = await self._aretry(
+            lambda: self._client.post(f"{self.base_url}/v1/messages", json=payload)
         )
         if response.status_code != 200:
             raise RuntimeError(f"Anthropic API {response.status_code}: {response.text[:500]}")
-        return from_anthropic_response(response.json())
+        result = from_anthropic_response(response.json())
+        _accumulate(self.total_usage, result.usage)
+        return result
+
+    async def _aretry(self, fn):
+        """异步版重试：与同步路径同样的可重试判定与指数退避。"""
+        import asyncio
+
+        from .llm import _should_retry
+
+        last: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                return await fn()
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if attempt >= MAX_RETRIES or not _should_retry(exc):
+                    raise
+                await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
+        raise last  # pragma: no cover —— 循环内必然 return 或 raise
 
     async def achat_stream(self, messages: list, tools: list | None = None):
         from .llm import AsyncStreamResult
@@ -348,8 +404,6 @@ class AsyncAnthropicLLM:
         return result.bind(self._aconsume_stream(self._build_payload(messages, tools, stream=True), result))
 
     async def _aconsume_stream(self, payload: dict, result):
-        from .llm import AsyncStreamResult
-
         state: Dict[str, Any] = {"blocks": {}, "usage": {}}
         async with self._client.stream("POST", f"{self.base_url}/v1/messages", json=payload) as response:
             if response.status_code != 200:
@@ -363,9 +417,20 @@ class AsyncAnthropicLLM:
                 if text:
                     yield text
         result.response = finalize_stream(state)
+        _accumulate(self.total_usage, result.response.usage)
 
     def _build_payload(self, messages: list, tools: list | None, stream: bool) -> dict:
         return build_payload(self.model, self.temperature, self.max_tokens, messages, tools, stream)
 
     async def aembeddings(self, texts: List[str], model: str) -> List[List[float]]:
         raise NotImplementedError("Anthropic 协议没有 embeddings 接口，RAG 请改用 OpenAI 兼容客户端")
+
+    async def aclose(self) -> None:
+        """关闭底层异步 HTTP 连接池（此前从不关闭 → 连接泄漏）。"""
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "AsyncAnthropicLLM":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.aclose()

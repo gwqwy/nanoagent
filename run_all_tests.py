@@ -1,10 +1,12 @@
 import sys
 import unittest
+from pathlib import Path
 
-sys.path.insert(0, r"E:\文件\编程文件\agent\nanoagent")
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 
 loader = unittest.TestLoader()
-suite = loader.discover(r"E:\文件\编程文件\agent\nanoagent\tests")
+suite = loader.discover(str(ROOT / "tests"))
 runner = unittest.TextTestRunner(stream=sys.stdout, verbosity=1)
 result = runner.run(suite)
 sys.exit(0 if result.wasSuccessful() else 1)

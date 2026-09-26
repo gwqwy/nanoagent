@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -148,17 +149,46 @@ class Workflow:
         self._checkpoint = resolve_checkpoint(checkpoint_path) if checkpoint_path else None
 
     # ------------------------------------------------------------------
+    # 否定词：出现在 pass_marker 前面时，该处标记不算通过
+    # （否则末行 "NOT PASS" 会因含子串 "PASS" 被误判为通过，审查环节形同虚设）
+    _NEGATION_WORDS = frozenset({
+        "not", "no", "never", "cannot", "can't", "un",
+        "不", "未", "非", "没有", "无法", "不能",
+    })
+
+    def _has_pass_marker(self, text: str) -> bool:
+        """文本中是否存在**未被否定**的 pass 标记（要求独立词，避免 NOT_PASS 命中）。"""
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9_\-])" + re.escape(self.pass_marker) + r"(?![A-Za-z0-9_\-])",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(text):
+            prefix = text[: match.start()].rstrip()
+            if not prefix:
+                return True
+            last_word = re.split(r"[\s，,。;；:：、!！?？]+", prefix)[-1].strip().lower()
+            if last_word not in self._NEGATION_WORDS:
+                return True
+        return False
+
+    def _has_fail_marker(self, text: str) -> bool:
+        """文本中是否存在 fail 标记（同样要求独立词）。"""
+        return bool(re.search(
+            r"(?<![A-Za-z0-9_\-])" + re.escape(self.FAIL_MARKER) + r"(?![A-Za-z0-9_\-])",
+            text, re.IGNORECASE,
+        ))
+
     def _is_pass(self, review: str) -> bool:
-        """PASS 判定：末行 FAIL 优先（保守），其次末行 PASS，最后兜底整体判断。"""
+        """PASS 判定：末行 FAIL 优先（保守），其次末行未被否定的 PASS，最后兜底整体判断。"""
         lines = [line.strip() for line in review.strip().splitlines() if line.strip()]
         if not lines:
             return False
         last = lines[-1]
-        if self.FAIL_MARKER in last:
+        if self._has_fail_marker(last):
             return False
-        if self.pass_marker in last:
+        if self._has_pass_marker(last):
             return True
-        return self.pass_marker in review and self.FAIL_MARKER not in review
+        return self._has_pass_marker(review) and not self._has_fail_marker(review)
 
     # ------------------------------------------------------------------
     def _persist(self, state: dict) -> None:

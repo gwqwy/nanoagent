@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -37,6 +38,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .skills import SkillRegistry
 from .tools import Tool
+
+_logger = logging.getLogger(__name__)
 
 # 对齐 dsh 的 fiber 状态机
 PENDING = "PENDING"
@@ -82,7 +85,8 @@ class EventBus:
             try:
                 handler(**payload)
             except Exception:  # noqa: BLE001 —— 观察者出错不阻断宿主流程
-                pass
+                # 但不能静默：否则插件监听器坏了宿主完全无感
+                _logger.warning("事件 %r 的监听器 %r 执行失败", event, handler, exc_info=True)
 
 
 # ----------------------------------------------------------------------
@@ -158,8 +162,14 @@ class PluginContext:
         return dispose
 
     def on(self, event: str, handler: Callable) -> Callable:
-        """订阅宿主事件（activate/deactivate/error），返回 disposer。"""
-        return self.bus.on(event, handler)
+        """订阅宿主事件（activate/deactivate/error），返回 disposer。
+
+        注意：disposer **必须入账本**，否则插件卸载后监听器仍驻留在事件总线上
+        （幽灵监听器），反复装卸会持续累积。
+        """
+        dispose = self.bus.on(event, handler)
+        self._disposers.append(dispose)
+        return dispose
 
     def effect(self, fn: Callable[[], Optional[Callable]]) -> None:
         """执行 fn 并把其返回的 disposer 记入账本（dsh 的 ctx.effect）。"""
@@ -254,6 +264,8 @@ def _load_nanoagent(plugin: Plugin, ctx: PluginContext) -> None:
         except Exception:
             sys.modules.pop(module_name, None)
             raise
+        # 卸载时把模块从 sys.modules 摘掉，否则反复扫描/热加载会持续累积模块对象
+        ctx._add_disposer(lambda name=module_name: sys.modules.pop(name, None))
         register_fn = getattr(module, "register", None)
         if callable(register_fn):
             register_fn(ctx)

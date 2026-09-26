@@ -236,6 +236,34 @@ class GitAndProcessTests(unittest.TestCase):
         self.assertIn("子任务A", result)
         self.assertEqual(calls, ["帮手"])
 
+    def test_spawn_subagent_counter_independent_from_pid(self):
+        """N-17：子代理会话编号与后台进程 pid 各用独立计数器，互不影响。"""
+        from nanoagent import Agent
+
+        seen = []
+
+        def factory(instructions: str):
+            def _run(task, session_id=None, **kw):
+                seen.append(session_id)
+                return type("R", (), {"content": "ok"})()
+
+            agent = Agent(llm=MockLLM([]))
+            agent.run = _run  # type: ignore[assignment]
+            return agent
+
+        ws = CodingWorkspace(self.ws.root, agent_factory=factory, auto_approve=True)
+        # 先起一个后台进程，消耗一个 pid
+        started = ws.start_process("echo hi")
+        self.assertIn("#1", started)
+        self.assertEqual(ws._next_pid, 2)
+
+        ws.spawn_subagent("任务A")
+        ws.spawn_subagent("任务B")
+        # 子代理编号从 1 开始，不受已用掉的 pid 影响
+        self.assertEqual(seen, ["subagent-1", "subagent-2"])
+        self.assertEqual(ws._next_pid, 2)  # pid 计数器未被 spawn 改写
+        ws.stop_process(1)  # 清理后台进程
+
 
 class AgentIntegrationTests(unittest.TestCase):
     def test_agent_writes_and_reads_via_tools(self):

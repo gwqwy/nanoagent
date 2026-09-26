@@ -49,7 +49,7 @@ class EvalCase:
     judge_rubric: Optional[str] = None          # 提供则启用 LLM-as-judge
     judge_threshold: float = 70.0               # judge 模式的及格线
     tools: Optional[List[Any]] = None           # 本用例专属工具（临时注册）
-    session_id: str = "eval"                    # 每个用例用独立会话，互不污染
+    session_id: str = ""                        # 留空 = 自动用 "eval-<用例名>"，互不污染
 
 
 @dataclass
@@ -173,8 +173,18 @@ class EvalRunner:
 
     # ------------------------------------------------------------------
     def run_case(self, agent: Any, case: EvalCase) -> CaseReport:
-        """跑单个用例：每例独立会话；用例自带工具时临时注册。"""
+        """跑单个用例：每例独立会话；用例自带工具时临时注册。
+
+        会话隔离：session_id 留空时按用例名生成（"eval-<用例名>"）并在开跑前清空，
+        否则所有用例共用同一会话，前一个用例的对话历史会泄漏进下一个（评测结果不可信）。
+        显式指定 session_id 的用例尊重用户选择，不做清空。
+        """
         started = time.perf_counter()
+        session_id = case.session_id or f"eval-{case.name}"
+        if not case.session_id:
+            memory = getattr(agent, "memory", None)
+            if memory is not None and hasattr(memory, "clear"):
+                memory.clear(session_id)   # 同用例重跑也要从干净状态开始
         try:
             from .tools import ToolRegistry
 
@@ -187,7 +197,7 @@ class EvalRunner:
                     merged.register(item)
                 agent.tools = merged
             try:
-                result = agent.run(case.question, session_id=case.session_id)
+                result = agent.run(case.question, session_id=session_id)
             finally:
                 agent.tools = original_tools
 

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import struct
 import zlib
 from pathlib import Path
@@ -53,7 +54,8 @@ def image_part(source: ImageSource, detail: Optional[str] = None) -> Dict[str, A
     detail: "low"/"high"/"auto"，对齐 OpenAI 视觉参数，透传给服务商。
     """
     if isinstance(source, dict):
-        part = dict(source)
+        # 深拷贝：避免下方写 detail 时污染调用方传入的嵌套 dict
+        part = copy.deepcopy(source)
     elif isinstance(source, (str, Path)):
         text = str(source)
         if text.startswith(("http://", "https://", "data:")):
@@ -75,7 +77,12 @@ def image_part(source: ImageSource, detail: Optional[str] = None) -> Dict[str, A
         raise TypeError(f"不支持的图片源类型: {type(source)!r}")
 
     if detail is not None:
-        part["image_url"]["detail"] = detail
+        inner = part.get("image_url")
+        if not isinstance(inner, dict):
+            raise ValueError(
+                f"图片 content part 缺少 image_url 字段，无法设置 detail: {part.get('type', part)!r}"
+            )
+        inner["detail"] = detail
     return part
 
 

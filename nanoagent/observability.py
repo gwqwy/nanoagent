@@ -32,6 +32,19 @@ def load_trace(path: str | Path) -> List[Dict[str, Any]]:
     return events
 
 
+# 事件类型键：现行写法是 "event"；早期版本写的是 "type"（两者都读，保证旧 trace 文件仍可分析）
+_KIND_KEYS = ("event", "type")
+_RESERVED_KEYS = ("run_id", "event", "type", "ts")
+
+
+def event_kind(event: Dict[str, Any]) -> Any:
+    """读取事件类型，兼容历史键名 "type"。"""
+    for key in _KIND_KEYS:
+        if key in event:
+            return event[key]
+    return None
+
+
 def trace_summary(path: str | Path) -> Dict[str, Any]:
     """把 trace 文件汇总成结构化统计：按 run 分组的调用数、token、工具。"""
     events = load_trace(path)
@@ -41,7 +54,7 @@ def trace_summary(path: str | Path) -> Dict[str, Any]:
     })
     for event in events:
         run = runs[event.get("run_id", "unknown")]
-        kind = event.get("event")
+        kind = event_kind(event)
         if kind == "llm_call":
             run["llm_calls"] += 1
             usage = event.get("usage") or {}
@@ -71,10 +84,10 @@ def trace_report(path: str | Path, out_path: str | Path) -> Path:
 
     event_rows = []
     for event in events[:500]:  # 明细最多展示 500 条，防止报告过大
-        payload = {k: v for k, v in event.items() if k not in ("run_id", "event", "ts")}
+        payload = {k: v for k, v in event.items() if k not in _RESERVED_KEYS}
         event_rows.append(
             f"<tr><td>{html.escape(str(event.get('run_id', '')))}</td>"
-            f"<td>{html.escape(str(event.get('event', '')))}</td>"
+            f"<td>{html.escape(str(event_kind(event) or ''))}</td>"
             f"<td>{html.escape(str(event.get('ts', '')))}</td>"
             f"<td><code>{html.escape(json.dumps(payload, ensure_ascii=False))[:300]}</code></td></tr>"
         )
@@ -128,10 +141,10 @@ def export_traces_to_otel(path: str | Path, service_name: str = "nanoagent") -> 
         with tracer.start_as_current_span(f"agent.run", kind=SpanKind.INTERNAL) as parent:
             parent.set_attribute("nanoagent.run_id", str(run_id))
             for event in run_events:
-                kind = event.get("event", "event")
+                kind = event_kind(event) or "event"
                 with tracer.start_as_current_span(f"nanoagent.{kind}") as child:
                     for key, value in event.items():
-                        if key in ("run_id", "event"):
+                        if key in _KIND_KEYS or key == "run_id":
                             continue
                         child.set_attribute(f"nanoagent.{key}", str(value)[:200])
                     exported += 1

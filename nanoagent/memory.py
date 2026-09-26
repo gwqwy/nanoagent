@@ -3,12 +3,35 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+_logger = logging.getLogger(__name__)
+
 # 视觉模型对每张图片的计费上限（DeepSeek 实测值），用于估算多模态消息
 IMAGE_TOKEN_ESTIMATE = 1024
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """原子写：临时文件 + fsync + os.replace，避免写到一半被读到/崩溃后留下半截文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding=encoding, newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def estimate_tokens(text: str) -> int:
@@ -68,6 +91,8 @@ class Memory:
         self.max_tokens = max_tokens
         self.persist_path = Path(persist_path) if persist_path else None
         self._sessions: Dict[str, List[dict]] = {}
+        # 持久化文件损坏时置位：禁止 save() 用空历史覆盖用户的原始数据
+        self._persist_blocked = False
         if self.persist_path and self.persist_path.exists():
             self._load()
 
@@ -116,19 +141,41 @@ class Memory:
 
     # ------------------------------------------------------------------
     def save(self) -> Optional[Path]:
-        """把全部会话写入 JSON 文件，返回文件路径；未配置持久化路径时返回 None。"""
+        """把全部会话原子写入 JSON 文件，返回文件路径；未配置持久化路径时返回 None。
+
+        若加载时发现文件已损坏（_persist_blocked），这里**拒绝写入** ——
+        否则会用当前的空历史覆盖掉用户那份仍然可人工修复的原始数据。
+        """
         if not self.persist_path:
             return None
-        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
-        self.persist_path.write_text(
-            json.dumps(self._sessions, ensure_ascii=False, indent=2), encoding="utf-8"
+        if self._persist_blocked:
+            _logger.warning(
+                "记忆文件此前解析失败，已阻止写入以避免覆盖原始数据: %s", self.persist_path
+            )
+            return None
+        _atomic_write_text(
+            self.persist_path,
+            json.dumps(self._sessions, ensure_ascii=False, indent=2),
         )
         return self.persist_path
 
     def _load(self) -> None:
         try:
-            data = json.loads(self.persist_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            raw = self.persist_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            _logger.warning("记忆文件读取失败: %s（%s）", self.persist_path, exc)
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            # 绝不静默清空历史：备份原文件、告警、并锁定写入
+            backup = self._backup_corrupt()
+            self._persist_blocked = True
+            _logger.warning(
+                "记忆文件无法解析（%s），原文件已备份到 %s；本次不加载历史，"
+                "且在修复前不会写回，以免覆盖原始数据。",
+                exc, backup,
+            )
             return
         if isinstance(data, dict):
             self._sessions = {
@@ -136,6 +183,16 @@ class Memory:
                 for sid, msgs in data.items()
                 if isinstance(msgs, list)
             }
+
+    def _backup_corrupt(self) -> Path:
+        """把损坏的持久化文件另存一份，返回备份路径（失败时返回原路径）。"""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self.persist_path.with_name(f"{self.persist_path.name}.corrupt-{stamp}")
+        try:
+            shutil.copy2(self.persist_path, backup)
+        except OSError:
+            return self.persist_path
+        return backup
 
 
 class SummaryMemory(Memory):
@@ -177,16 +234,37 @@ class SummaryMemory(Memory):
     def _trim(self, session_id: str, history: List[dict]) -> None:
         """覆盖父类的滑窗裁剪：把被裁掉的旧消息压缩进摘要而不是丢弃。
 
-        可压缩消息不足 keep_recent 时跳过（token 触发但无旧消息可压，
-        避免一次无效的 LLM 调用）。
+        keep_recent 是**软约束**（上限内尽量多保留），不是硬豁免：
+        超过 token 上限时，连保留窗口内的最旧消息也会被并入摘要，
+        否则 keep_recent 自身超标时裁剪就变成 no-op，上下文会持续膨胀。
         """
         if len(history) > self.keep_recent:
             self._compress(session_id, history)
+        # 二次压缩：保留窗口自身仍超 token 预算时，逐步把最旧的一条并入摘要
+        while len(history) > 1 and self._over_limit_with_summary(session_id, history):
+            before = len(history)
+            self._compress(session_id, history, keep=before - 1)
+            if len(history) >= before:   # 防御：压缩没有减少条数时退化为直接丢弃
+                del history[0]
 
-    def _compress(self, session_id: str, history: List[dict]) -> None:
-        """把超窗的旧消息压缩进摘要，只保留最近 keep_recent 条。"""
-        evicted = history[: len(history) - self.keep_recent]
-        history[:] = history[-self.keep_recent :]
+    def _over_limit_with_summary(self, session_id: str, history: List[dict]) -> bool:
+        """在父类上限判定之外，把摘要自身占用的 token 也算进来。"""
+        if self._over_limit(history):
+            return True
+        if not self.max_tokens:
+            return False
+        summary = self._summaries.get(session_id) or ""
+        if not summary:
+            return False
+        return self._history_tokens(history) + estimate_tokens(summary) > self.max_tokens
+
+    def _compress(self, session_id: str, history: List[dict], keep: int | None = None) -> None:
+        """把超窗的旧消息压缩进摘要，只保留最近 keep 条（默认 keep_recent）。"""
+        keep = self.keep_recent if keep is None else max(1, min(keep, len(history) - 1))
+        evicted = history[: len(history) - keep]
+        if not evicted:
+            return
+        history[:] = history[-keep:]
 
         transcript = "\n".join(f"{m['role']}: {m['content']}" for m in evicted)
         if self._summaries.get(session_id):
@@ -222,20 +300,37 @@ class SummaryMemory(Memory):
     def save(self) -> Optional[Path]:
         if not self.persist_path:
             return None
-        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._persist_blocked:
+            _logger.warning(
+                "记忆文件此前解析失败，已阻止写入以避免覆盖原始数据: %s", self.persist_path
+            )
+            return None
         payload = {
             "sessions": self._sessions,
             "summaries": self._summaries,
         }
-        self.persist_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        _atomic_write_text(
+            self.persist_path,
+            json.dumps(payload, ensure_ascii=False, indent=2),
         )
         return self.persist_path
 
     def _load(self) -> None:
         try:
-            data = json.loads(self.persist_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            raw = self.persist_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            _logger.warning("记忆文件读取失败: %s（%s）", self.persist_path, exc)
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            backup = self._backup_corrupt()
+            self._persist_blocked = True
+            _logger.warning(
+                "记忆文件无法解析（%s），原文件已备份到 %s；本次不加载历史，"
+                "且在修复前不会写回，以免覆盖原始数据。",
+                exc, backup,
+            )
             return
         if isinstance(data, dict) and "sessions" in data:
             self._summaries = dict(data.get("summaries") or {})

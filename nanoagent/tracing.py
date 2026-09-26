@@ -7,10 +7,16 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Optional
+
+
+# 并行工具会从多个工作线程调用 Tracer.log，同一文件必须以单次 write 原子落盘，
+# 否则 Windows 下追加写可能交错出半行 JSON（被 load_trace 静默丢弃）。
+_WRITE_LOCK = threading.Lock()
 
 
 class Tracer:
@@ -43,13 +49,17 @@ class Tracer:
         """
         if not self.enabled:
             return
-        record = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "type": event_type}
+        # 键名必须与 observability 的读取方一致（event.get("event")）；
+        # 历史上这里写的是 "type"，导致 trace_summary/trace_report/OTel 统计恒为 0。
+        record = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event_type}
         if self.run_id is not None:
             record["run_id"] = self.run_id
         record.update(data)
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            with _WRITE_LOCK:
+                with self.path.open("a", encoding="utf-8") as f:
+                    f.write(line)
         except OSError:
             pass

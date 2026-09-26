@@ -79,18 +79,23 @@ class SummaryAutoCompactTests(unittest.TestCase):
                 return LLMResponse(content="摘要内容")
 
         llm = CountingLLM()
-        # 每条约 22 token；max_tokens=40，第 3 条写入后超限且可压缩数 > keep_recent
+        # 每条约 22 token；max_tokens=40，写入后超限即自动触发压缩（Claude Code 式 compaction）
         memory = SummaryMemory(max_messages=50, keep_recent=2, max_tokens=40, llm=llm)
         memory.add("s", "user", "这是第一条相当长的消息用于撑高token数量估计值")
         memory.add("s", "user", "这是第二条相当长的消息用于撑高token数量估计值")
         memory.add("s", "user", "这是第三条相当长的消息用于撑高token数量估计值")
-        self.assertEqual(llm.calls, 1)  # token 超限自动触发压缩（Claude Code 式 compaction）
+        self.assertGreaterEqual(llm.calls, 1)  # token 超限自动触发压缩
         self.assertEqual(memory.summary("s"), "摘要内容")
-        # 压缩后原始消息只剩 keep_recent 条；history() 额外多一条注入的摘要
+        # 压缩后原始消息只剩 keep_recent 条以内；history() 额外多一条注入的摘要
         history = memory.history("s")
         self.assertEqual(history[0]["role"], "system")
         self.assertIn("摘要", history[0]["content"])
         self.assertLessEqual(len(history) - 1, 2)
+        # 关键不变量：token 上限必须真正生效（含摘要自身占用），keep_recent 只是软约束
+        from nanoagent.memory import estimate_tokens
+
+        used = memory.tokens("s") + estimate_tokens(memory.summary("s"))
+        self.assertLessEqual(used, 40, f"token 上限失效：实际占用 {used}")
 
     def test_no_compression_when_within_budget(self):
         class NoCallLLM:

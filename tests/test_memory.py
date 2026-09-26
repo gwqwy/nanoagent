@@ -66,8 +66,11 @@ class TracerTests(unittest.TestCase):
             tracer.end_run(status="ok")
 
             lines = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
-            types = [l["type"] for l in lines]
-            self.assertEqual(types, ["run_start", "tool_call", "run_end"])
+            # 键名必须是 "event"：observability.trace_summary 按 event.get("event") 读取，
+            # 两边不一致会让可观测性统计恒为 0（缺陷审计 N-02）。
+            self.assertNotIn("type", lines[0])
+            kinds = [l["event"] for l in lines]
+            self.assertEqual(kinds, ["run_start", "tool_call", "run_end"])
             self.assertEqual(lines[1]["tool"], "demo")
             # run 内所有事件都应携带同一个 run_id
             run_ids = {l.get("run_id") for l in lines}
@@ -77,6 +80,31 @@ class TracerTests(unittest.TestCase):
     def test_none_path_disables(self):
         tracer = Tracer(path=None)
         self.assertFalse(tracer.enabled)
+
+    def test_concurrent_log_lines_are_not_interleaved(self):
+        # N-15 回归：并行工具会从多个工作线程调用 Tracer.log，
+        # 同一文件必须以单次 write 原子落盘，任何一行都应是完整合法 JSON。
+        import threading
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "trace.jsonl"
+            tracer = Tracer(path=path)
+            tracer.start_run("tester")
+
+            def worker(tid: int) -> None:
+                for i in range(200):
+                    tracer.log("evt", tid=tid, i=i, payload="x" * 200)
+
+            threads = [threading.Thread(target=worker, args=(t,)) for t in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            lines = path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(lines), 1 + 8 * 200)  # run_start + 8 线程 × 200 条
+            for line in lines:
+                json.loads(line)  # 任一行解析失败即说明写入被交错
 
 
 if __name__ == "__main__":

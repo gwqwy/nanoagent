@@ -95,13 +95,31 @@ class VectorStore:
         source = Path(path)
         if not source.exists():
             raise FileNotFoundError(f"向量库文件不存在: {source}")
-        payload = json.loads(source.read_text(encoding="utf-8"))
+        try:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"向量库文件不是合法 JSON: {source}（{exc}）") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"向量库文件结构错误（应为对象）: {source}")
         store = cls()
         vectors = payload.get("vectors") or []
         store.texts = list(payload.get("texts") or [])
-        store.metadata = list(payload.get("metadata") or [{} for _ in store.texts])
+        metadata = payload.get("metadata")
+        store.metadata = list(metadata) if isinstance(metadata, list) else []
+        # 形状校验：三者长度必须一致，否则 search() 会在 metadata[i] 上 IndexError
+        if len(store.metadata) < len(store.texts):
+            store.metadata = store.metadata + [{} for _ in range(len(store.texts) - len(store.metadata))]
         if vectors:
-            store.vectors = np.asarray(vectors, dtype=np.float32)
+            array = np.asarray(vectors, dtype=np.float32)
+            if array.ndim != 2:
+                raise ValueError(f"向量库 vectors 形状非法（应为二维矩阵）: {source}")
+            if array.shape[0] != len(store.texts):
+                raise ValueError(
+                    f"向量库数据不一致：{len(store.texts)} 条文本 vs {array.shape[0]} 条向量（{source}）"
+                )
+            store.vectors = array
+        elif store.texts:
+            store.vectors = None
         return store
 
 

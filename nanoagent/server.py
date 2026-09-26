@@ -9,12 +9,18 @@
     POST /sessions/{session_id}/clear
     GET  /sessions
     GET  /health
+
+鉴权：设置环境变量 NANOAGENT_API_TOKEN 后，除 /health 外的接口都要求
+`Authorization: Bearer <token>`。未设置时默认只监听 127.0.0.1（本机使用）；
+若要对外暴露（host=0.0.0.0）则**必须**设置该 token，否则拒绝启动。
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import os
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel
@@ -26,6 +32,7 @@ from .memory import Memory
 from .tracing import Tracer
 
 SESSIONS_FILE = ".nanoagent/sessions.json"
+API_TOKEN_ENV = "NANOAGENT_API_TOKEN"
 
 
 class ChatRequest(BaseModel):
@@ -56,16 +63,34 @@ def build_agent() -> Agent:
     )
 
 
+def _api_token() -> str:
+    """服务端 token（空串表示未启用鉴权，仅限本机监听）。"""
+    load_dotenv()
+    return (os.environ.get(API_TOKEN_ENV) or "").strip()
+
+
 def create_app(agent: Agent | None = None):
     """应用工厂，测试时可注入 mock agent。"""
-    from fastapi import FastAPI, HTTPException
+    from fastapi import Depends, FastAPI, Header, HTTPException
 
     agent = agent or build_agent()
 
     app = FastAPI(title="nanoagent", version=_version())
 
+    def require_token(authorization: Optional[str] = Header(default=None)) -> None:
+        """启用鉴权时校验 Bearer token；未配置 token 时直接放行（本机模式）。"""
+        token = _api_token()
+        if not token:
+            return
+        presented = (authorization or "").strip()
+        if not hmac.compare_digest(presented, f"Bearer {token}"):
+            raise HTTPException(
+                status_code=401,
+                detail=f"缺少或无效的 Authorization 头（应为 Bearer <{API_TOKEN_ENV}>）",
+            )
+
     @app.post("/chat")
-    async def chat(req: ChatRequest) -> ChatResponse:
+    async def chat(req: ChatRequest, _: None = Depends(require_token)) -> ChatResponse:
         if not req.message.strip():
             raise HTTPException(status_code=400, detail="message 不能为空")
         try:
@@ -83,7 +108,7 @@ def create_app(agent: Agent | None = None):
         )
 
     @app.post("/chat/stream")
-    async def chat_stream(req: ChatRequest):
+    async def chat_stream(req: ChatRequest, _: None = Depends(require_token)):
         """SSE 流式端点。事件格式：
             data: {"type": "delta", "text": "..."}
             data: {"type": "tool_call", "name": "...", "arguments": {...}, "result": "..."}
@@ -125,12 +150,12 @@ def create_app(agent: Agent | None = None):
         return StreamingResponse(event_source(), media_type="text/event-stream")
 
     @app.post("/sessions/{session_id}/clear")
-    def clear_session(session_id: str) -> Dict[str, str]:
+    def clear_session(session_id: str, _: None = Depends(require_token)) -> Dict[str, str]:
         agent.memory.clear(session_id)
         return {"status": "cleared", "session_id": session_id}
 
     @app.get("/sessions")
-    def sessions() -> Dict[str, List[str]]:
+    def sessions(_: None = Depends(require_token)) -> Dict[str, List[str]]:
         return {"sessions": agent.memory.sessions()}
 
     @app.get("/health")
@@ -150,6 +175,17 @@ app = create_app()
 
 
 if __name__ == "__main__":
+    import sys
+
     import uvicorn
 
-    uvicorn.run("nanoagent.server:app", host="127.0.0.1", port=8000)
+    host = os.environ.get("NANOAGENT_HOST", "127.0.0.1")
+    port = int(os.environ.get("NANOAGENT_PORT", "8000"))
+    if host not in ("127.0.0.1", "localhost", "::1") and not _api_token():
+        print(
+            f"拒绝启动：监听 {host} 会把接口暴露到本机之外，"
+            f"请先设置环境变量 {API_TOKEN_ENV}（Bearer token）再启动。",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    uvicorn.run("nanoagent.server:app", host=host, port=port)

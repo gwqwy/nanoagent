@@ -139,11 +139,18 @@ def cmd_remove_plugin(args: argparse.Namespace) -> int:
 
 
 def cmd_remove_skill(args: argparse.Namespace) -> int:
-    target = Path(args.config) / "skills" / args.name
-    if not target.is_dir():
-        raise SystemExit(f"技能不存在: {target}")
-    shutil.rmtree(target)
-    print(f"已移除技能 '{args.name}'")
+    base = Path(args.config) / "skills"
+    # N-20：技能既可能是 skills/<name>/ 目录，也可能是用户手动放入的单文件
+    # skills/<name>.md / skills/<name>，三种形态都应可移除。
+    candidates = [base / args.name, base / f"{args.name}.md"]
+    target = next((c for c in candidates if c.is_dir() or c.is_file()), None)
+    if target is None:
+        raise SystemExit(f"技能不存在: {base / args.name}")
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    print(f"已移除技能 '{args.name}' -> {target}")
     return 0
 
 

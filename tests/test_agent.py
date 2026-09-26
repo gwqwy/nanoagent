@@ -3,6 +3,7 @@
 import unittest
 
 from nanoagent.agent import Agent
+from nanoagent.llm import LLMResponse, ToolCall
 from nanoagent.memory import Memory
 from nanoagent.tools import tool
 from tests.mocks import MockLLM, text_response, tool_response
@@ -103,6 +104,34 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(messages[-1]["role"], "user")
         self.assertEqual(messages[-1]["content"], "新问题")
 
+    def test_memory_tool_traces_opt_in(self):
+        """N-22：默认不存工具轨迹；开启后把工具调用以可读文本写入记忆。"""
+        memory = Memory()
+        responses = [
+            tool_response("c1", "get_weather", {"city": "上海"}),
+            text_response("上海晴。"),
+        ]
+        agent = make_agent(responses, memory=memory)  # 默认 memory_tool_traces=False
+        agent.run("上海天气", session_id="t0")
+        self.assertEqual([m["role"] for m in memory.history("t0")], ["user", "assistant"])
+
+        memory2 = Memory()
+        agent2 = make_agent(
+            [
+                tool_response("c1", "get_weather", {"city": "上海"}),
+                text_response("上海晴。"),
+            ],
+            memory=memory2,
+            memory_tool_traces=True,
+        )
+        agent2.run("上海天气", session_id="t1")
+        history = memory2.history("t1")
+        self.assertEqual([m["role"] for m in history], ["user", "assistant", "assistant"])
+        self.assertIn("[工具调用记录]", history[1]["content"])
+        self.assertIn("get_weather", history[1]["content"])
+        self.assertIn("上海 晴 25℃", history[1]["content"])
+        self.assertEqual(history[2]["content"], "上海晴。")
+
 
 class AgentStreamTests(unittest.TestCase):
     def test_stream_events(self):
@@ -126,6 +155,29 @@ class AgentStreamTests(unittest.TestCase):
         self.assertEqual(len(tool_events), 1)
         self.assertEqual(tool_events[0]["result"], "上海 晴 25℃")
         self.assertEqual(events[-1]["result"].content, "上海晴。")
+
+    def test_stream_result_carries_usage_and_reasoning(self):
+        # N-19 回归：run_stream 的 AgentResult 需与 run() 一致，聚合 usage / reasoning
+        agent = make_agent(
+            [
+                LLMResponse(
+                    content="",
+                    tool_calls=[ToolCall(id="c1", name="get_weather", arguments={"city": "北京"})],
+                    usage={"prompt_tokens": 10, "completion_tokens": 4},
+                    reasoning="先查天气",
+                ),
+                LLMResponse(
+                    content="北京晴。",
+                    usage={"prompt_tokens": 20, "completion_tokens": 6},
+                    reasoning="汇总结果",
+                ),
+            ]
+        )
+        events = list(agent.run_stream("北京天气"))
+        result = events[-1]["result"]
+        self.assertEqual(result.usage["prompt_tokens"], 30)
+        self.assertEqual(result.usage["completion_tokens"], 10)
+        self.assertEqual(result.reasoning, "先查天气\n\n汇总结果")
 
 
 if __name__ == "__main__":
