@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional
@@ -103,9 +104,15 @@ async def _aretry(fn, max_retries: int, backoff: float):
             await asyncio.sleep(backoff * (2 ** attempt))
 
 
+# 审计 N-10e：多个 agent 线程共享同一 LLM 实例时，total 的读-改-写必须互斥
+# （实测 2 线程 × 20 万次累加曾丢失 4 万+ 次更新）
+_ACCUMULATE_LOCK = threading.Lock()
+
+
 def _accumulate(total: Dict[str, int], usage: Dict[str, int]) -> None:
-    for key in ("prompt_tokens", "completion_tokens"):
-        total[key] = total.get(key, 0) + (usage.get(key, 0) or 0)
+    with _ACCUMULATE_LOCK:
+        for key in ("prompt_tokens", "completion_tokens"):
+            total[key] = total.get(key, 0) + (usage.get(key, 0) or 0)
 
 
 class LLM:
@@ -151,6 +158,10 @@ class LLM:
             kwargs["tools"] = tools
         if stream:
             kwargs["stream"] = True
+            # 审计 N-06：流式默认不含 usage 帧，total_usage 对流式恒为零。
+            # OpenAI 官方 API / DeepSeek / vLLM 均支持；个别兼容端点若返回 400，
+            # 需在子类里去掉该参数。
+            kwargs["stream_options"] = {"include_usage": True}
         if self.reasoning_effort:
             kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
         return kwargs
@@ -306,6 +317,10 @@ class AsyncLLM:
             kwargs["tools"] = tools
         if stream:
             kwargs["stream"] = True
+            # 审计 N-06：流式默认不含 usage 帧，total_usage 对流式恒为零。
+            # OpenAI 官方 API / DeepSeek / vLLM 均支持；个别兼容端点若返回 400，
+            # 需在子类里去掉该参数。
+            kwargs["stream_options"] = {"include_usage": True}
         if self.reasoning_effort:
             kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
         return kwargs

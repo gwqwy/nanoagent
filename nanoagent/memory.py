@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -105,6 +106,7 @@ class Memory:
         self.max_tokens = max_tokens
         self.persist_path = Path(persist_path) if persist_path else None
         self._sessions: Dict[str, List[dict]] = {}
+        self._lock = threading.Lock()  # 审计 N-10e：跨线程共享时的 add/history 互斥
         # 持久化文件损坏时置位：禁止 save() 用空历史覆盖用户的原始数据
         self._persist_blocked = False
         if self.persist_path and self.persist_path.exists():
@@ -122,13 +124,18 @@ class Memory:
         return sum(message_tokens(m.get("content", "")) for m in history)
 
     def add(self, session_id: str, role: str, content) -> None:
-        """追加一条消息，超过条数/token 任一上限时调用 _trim 裁剪。"""
-        history = self._sessions.setdefault(session_id, [])
-        history.append(
-            {"role": role, "content": content, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
-        )
-        if self._over_limit(history):
-            self._trim(session_id, history)
+        """追加一条消息，超过条数/token 任一上限时调用 _trim 裁剪。
+
+        setdefault + append + trim 是读-改-写（审计 N-10e）：多 agent 线程
+        共享同一 Memory 实例时需要互斥，否则可能丢失消息或裁剪时越界。
+        """
+        with self._lock:
+            history = self._sessions.setdefault(session_id, [])
+            history.append(
+                {"role": role, "content": content, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+            )
+            if self._over_limit(history):
+                self._trim(session_id, history)
 
     def _trim(self, session_id: str, history: List[dict]) -> None:
         """超窗时的裁剪策略：从最旧开始丢，直到条数与 token 都回到限内。

@@ -205,11 +205,19 @@ def parse_sse_event(event: Dict[str, Any], state: Dict[str, Any]) -> Optional[st
         usage = event.get("usage") or {}
         if usage:
             state.setdefault("usage", {})["completion_tokens"] = usage.get("output_tokens", 0)
+    elif etype == "error":
+        # 审计 N-10f：中途 error 事件此前被静默吞掉，残缺流被当正常响应收尾。
+        # 记入 state，由 finalize_stream 抛出，调用方才能感知失败。
+        err = event.get("error") or {}
+        state["error"] = f"{err.get('type', 'api_error')}: {err.get('message', '未知错误')}"
     return None
 
 
 def finalize_stream(state: Dict[str, Any]) -> LLMResponse:
     """流结束：把累积的 blocks/usage 组装成完整 LLMResponse。"""
+    # 审计 N-10f：中途收到 error 事件时显式失败，而不是把残缺流当正常响应
+    if state.get("error"):
+        raise RuntimeError(f"Anthropic 流式响应中途出错: {state['error']}")
     content = "".join(
         entry["text"] for _index, entry in sorted(state["blocks"].items())
         if entry["kind"] == "text"

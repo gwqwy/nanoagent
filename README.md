@@ -195,7 +195,7 @@ Workflow 的阶段是预先编排死的固定 SOP；TaskRunner 的步骤清单�
 ```python
 from nanoagent import TaskRunner
 
-runner = TaskRunner(agent, checkpoint_path="task.json")
+runner = TaskRunner(agent, checkpoint="task.json")
 result = runner.run("为项目补全测试并保证全部通过")   # 模型拆解 → 逐项执行 → 汇总
 print(result.summary)                # 最终汇总
 print(result.summary_lines())        # 每项的状态与结果（✓/✗）

@@ -61,14 +61,36 @@ class MCPServer:
 
     # ------------------------------------------------------------------
     async def _finish_connect(self, transport_cm: Any) -> None:
-        """在传输之上建立会话并完成初始化握手（三种传输共用）。"""
+        """在传输之上建立会话并完成初始化握手（三种传输共用）。
+
+        握手后段失败必须回滚已成功的段（审计 N-03）：stdio 传输的 __aenter__
+        已经拉起了子进程，若 ClientSession/initialize 抛异常而不回滚，
+        子进程将永远挂着（泄漏），进程退出前无人清理。
+        """
         from mcp import ClientSession
 
         self._transport_cm = transport_cm
         read, write = await transport_cm.__aenter__()
-        self._session_cm = ClientSession(read, write)
-        self._session = await self._session_cm.__aenter__()
-        await self._session.initialize()
+        self._session_cm = None
+        try:
+            self._session_cm = ClientSession(read, write)
+            self._session = await self._session_cm.__aenter__()
+            await self._session.initialize()
+        except BaseException:
+            # 先关会话再关传输；单段失败不影响另一段的清理
+            if self._session_cm is not None:
+                try:
+                    await self._session_cm.__aexit__(None, None, None)
+                except BaseException:
+                    pass
+                self._session_cm = None
+                self._session = None
+            try:
+                await transport_cm.__aexit__(None, None, None)
+            except BaseException:
+                pass
+            self._transport_cm = None
+            raise
 
     @classmethod
     async def connect_stdio(
@@ -115,14 +137,30 @@ class MCPServer:
         return server
 
     async def disconnect(self) -> None:
-        """关闭会话与传输（与连接的资源获取顺序相反）。"""
+        """关闭会话与传输（与连接的资源获取顺序相反）。
+
+        逐层容错（审计 N-03）：一层的异常被收集，**两层都会被执行**——
+        否则 session 关闭失败会让 transport（stdio 子进程）永远无人关闭。
+        全部执行完后重抛第一个异常，调用方仍能感知失败。
+        """
+        errors: List[BaseException] = []
         if self._session_cm is not None:
-            await self._session_cm.__aexit__(None, None, None)
-            self._session_cm = None
-            self._session = None
+            try:
+                await self._session_cm.__aexit__(None, None, None)
+            except BaseException as exc:  # noqa: BLE001 —— 收集后继续关下一层
+                errors.append(exc)
+            finally:
+                self._session_cm = None
+                self._session = None
         if self._transport_cm is not None:
-            await self._transport_cm.__aexit__(None, None, None)
-            self._transport_cm = None
+            try:
+                await self._transport_cm.__aexit__(None, None, None)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                self._transport_cm = None
+        if errors:
+            raise errors[0]
 
     # ------------------------------------------------------------------
     async def list_tools(self) -> List[Tool]:
