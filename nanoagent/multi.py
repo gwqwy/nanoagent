@@ -1,8 +1,10 @@
 """多 agent 编排。
 
-三种模式（参考 CrewAI 的角色分工与 OpenAI Agents SDK 的 handoff）：
+四种模式（参考 CrewAI 的角色分工与 OpenAI Agents SDK 的 handoff）：
 - agent-as-tool 委托：把子 agent 注册成父 agent 的工具，由父 agent 决定何时调用
 - Pipeline 流水线：固定顺序，前一个 agent 的输出作为下一个的输入
+- Team 团队：leader 统筹、members 注册为工具按需委托
+- Roundtable 圆桌：多角色围绕同一议题轮流发言、互相回应，可选主持人总结
 - Workflow 工作流：计划 → 开发 ↔ 审查（反馈回路）→ 汇总，每个角色只看到
   自己需要的"产物包"，审查不过自动打回重做
 """
@@ -72,6 +74,70 @@ class Team:
     async def arun(self, task: str) -> str:
         """Team 的异步版。"""
         return (await self.leader.arun(task)).content
+
+
+@dataclass
+class RoundtableResult:
+    """一次圆桌讨论的完整记录。"""
+
+    topic: str
+    transcript: List[dict]   # [{"agent": 名, "round": 轮次, "statement": 发言}]
+    summary: str             # 主持人总结；未设主持人则为空串
+
+
+class Roundtable:
+    """圆桌讨论：多个角色围绕同一议题轮流发言若干轮，可选主持人总结。
+
+    与 Pipeline（串行加工）、Team（领导-成员分工）不同，圆桌适合
+    「多方观点碰撞后收敛」的场景：每个发言者都能看到此前全部发言，
+    后发言者可以回应、反驳或补充前面的人。
+
+    发言通过独立 session（save=False）进行，不污染各 agent 的既有会话历史。
+    """
+
+    def __init__(self, agents: Sequence[Agent], rounds: int = 2,
+                 moderator: Agent | None = None):
+        if not agents:
+            raise ValueError("圆桌至少需要一名参与者")
+        if rounds < 1:
+            raise ValueError("rounds 必须 >= 1")
+        self.agents: List[Agent] = list(agents)
+        self.rounds = rounds
+        self.moderator = moderator
+
+    @staticmethod
+    def _transcript_text(transcript: List[dict]) -> str:
+        return "\n".join(
+            f"[{t['agent']} 第{t['round']}轮] {t['statement']}" for t in transcript
+        ) or "（尚无发言）"
+
+    def _ask(self, agent: Agent, prompt: str, session_id: str) -> str:
+        return agent.run(prompt, session_id=session_id, save=False).content.strip()
+
+    def run(self, topic: str) -> RoundtableResult:
+        session_id = f"roundtable-{uuid.uuid4().hex[:8]}"
+        transcript: List[dict] = []
+        for round_no in range(1, self.rounds + 1):
+            for agent in self.agents:
+                prompt = (
+                    f"讨论议题：{topic}\n\n"
+                    f"目前的发言记录：\n{self._transcript_text(transcript)}\n\n"
+                    f"请以你的角色立场发表第 {round_no} 轮观点：简明扼要，"
+                    "可以直接回应其他人的发言，不要重复已有结论。"
+                )
+                transcript.append({
+                    "agent": agent.name, "round": round_no,
+                    "statement": self._ask(agent, prompt, session_id),
+                })
+        summary = ""
+        if self.moderator is not None:
+            summary = self.moderator.run(
+                f"讨论议题：{topic}\n\n"
+                f"全部发言记录：\n{self._transcript_text(transcript)}\n\n"
+                "请总结各方观点与共识，指出分歧点，给出明确的结论。",
+                session_id=session_id, save=False,
+            ).content.strip()
+        return RoundtableResult(topic=topic, transcript=transcript, summary=summary)
 
 
 @dataclass

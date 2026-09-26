@@ -128,7 +128,7 @@ class LLM:
         max_retries: int = 2,
         retry_backoff: float = 1.0,
         reasoning_effort: str | None = None,
-        context_window: int = 128000,
+        context_window: int = 1_000_000,
     ):
         from openai import OpenAI  # 延迟导入，纯逻辑单测不需要安装 openai
 
@@ -287,7 +287,7 @@ class AsyncLLM:
         max_retries: int = 2,
         retry_backoff: float = 1.0,
         reasoning_effort: str | None = None,
-        context_window: int = 128000,
+        context_window: int = 1_000_000,
     ):
         from openai import AsyncOpenAI  # 延迟导入，纯逻辑单测不需要安装 openai
 

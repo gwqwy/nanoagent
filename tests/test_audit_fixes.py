@@ -67,12 +67,10 @@ class McpConnectRollbackTests(unittest.TestCase):
             async def __aexit__(self, *exc):
                 return False
 
-        import nanoagent.mcp as m
 
         async def scenario():
             server = MCPServer()
             transport = FakeTransport()
-            real_client_session = m.ClientSession if hasattr(m, "ClientSession") else None
             # _finish_connect 内部 from mcp import ClientSession —— 打补丁替换
             import mcp as mcp_pkg
 
