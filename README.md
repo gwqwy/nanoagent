@@ -414,3 +414,7 @@ pip install nanoagent[browser]     :: 浏览器工具（需 playwright install c
   中途终止可用 `resume` 从第一个未完成项续跑。
 - token 估算：装有 tiktoken 时精确计数，否则零依赖启发式；Anthropic 协议无
   embeddings 接口，RAG 场景继续用 OpenAI 兼容客户端（`KnowledgeBase(llm=...)` 可单独指定）。
+
+## 许可证
+
+本项目采用 MIT 协议，详见 [LICENSE](LICENSE)。

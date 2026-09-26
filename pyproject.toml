@@ -3,6 +3,7 @@ name = "nanoagent"
 version = "0.1.0"
 description = "从零实现的轻量级 Python Agent 框架：agent loop + 工具调用 + 记忆 + RAG + 多 agent 编排"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.30",
