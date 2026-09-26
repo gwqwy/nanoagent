@@ -1,35 +1,93 @@
-"""token 化上下文管理测试：估算器、Memory 双维限窗、SummaryMemory 自动压缩触发。"""
+"""token 化上下文管理测试：估算器、Memory 双维限窗、SummaryMemory 自动压缩触发。
+
+⚠️ 估算器的取值**依赖运行环境**：装了 tiktoken 走 cl100k_base 精确计数，没装走零依赖启发式，
+两者对同一段文本给出的数字并不相同（例："abcdefgh" 精确=1 / 启发式=2）。
+CI 用 `pip install -e .[server,faiss,mcp,tiktoken]` 装了 tiktoken，开发机默认没装，
+所以**任何断言具体 token 数的用例都必须先用 `forced_heuristic()` 或 tiktoken 真值锁定路径**，
+否则会出现"本地绿、CI 红"。
+"""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from nanoagent.memory import Memory, SummaryMemory, estimate_tokens, message_tokens
+from nanoagent import memory as _memory
+from nanoagent.memory import Memory, SummaryMemory, _heuristic_estimate, estimate_tokens, message_tokens
+
+try:  # 是否装了 tiktoken（CI 装了，开发机通常没有）
+    import tiktoken as _tiktoken  # noqa: F401
+
+    _HAS_TIKTOKEN = True
+except ImportError:
+    _tiktoken = None
+    _HAS_TIKTOKEN = False
 
 
-class EstimateTests(unittest.TestCase):
+@contextlib.contextmanager
+def forced_heuristic():
+    """临时把编码器缓存置为不可用，强制 `estimate_tokens` 走零依赖启发式。
+
+    不用它的话，同一个用例在"装了 tiktoken"和"没装"的机器上会得到不同结果。
+    """
+    saved = _memory._TIKTOKEN_ENCODER
+    _memory._TIKTOKEN_ENCODER = False  # False = 不可用
+    try:
+        yield
+    finally:
+        _memory._TIKTOKEN_ENCODER = saved
+
+
+class HeuristicEstimateTests(unittest.TestCase):
+    """零依赖启发式算法本身——不依赖 tiktoken 装没装，取值恒定。"""
+
     def test_ascii_about_four_chars_per_token(self):
-        self.assertEqual(estimate_tokens("abcdefgh"), 2)  # 8 个 ASCII 字符
-        self.assertEqual(estimate_tokens(""), 0)
+        self.assertEqual(_heuristic_estimate("abcdefgh"), 2)  # 8 个 ASCII 字符
+        self.assertEqual(_heuristic_estimate("a" * 400), 100)
+        self.assertEqual(_heuristic_estimate(""), 0)
 
     def test_cjk_about_one_token_per_char(self):
-        self.assertEqual(estimate_tokens("你好世界"), 4)
+        self.assertEqual(_heuristic_estimate("你好世界"), 4)
 
     def test_mixed(self):
-        tokens = estimate_tokens("abc你好")
-        self.assertEqual(tokens, 1 + 2)  # abc≈1 + 两个汉字
+        self.assertEqual(_heuristic_estimate("abc你好"), 1 + 2)  # abc≈1 + 两个汉字
+
+
+class EstimateDispatchTests(unittest.TestCase):
+    """`estimate_tokens` 是调度器：能用 tiktoken 就精确，否则回退启发式。"""
+
+    def test_falls_back_to_heuristic_without_tiktoken(self):
+        with forced_heuristic():
+            self.assertEqual(estimate_tokens("abcdefgh"), 2)
+            self.assertEqual(estimate_tokens("你好世界"), 4)
+            self.assertEqual(estimate_tokens(""), 0)
+
+    @unittest.skipUnless(_HAS_TIKTOKEN, "未安装 tiktoken，跳过精确计数路径")
+    def test_prefers_tiktoken_when_available(self):
+        """装了 tiktoken 就必须真的走它——不能静默退化成启发式。
+
+        断言与真实编码结果逐个相等即可：这几个串上两者取值不同，相等本身就证明了走的是精确路径。
+        """
+        try:
+            encoder = _tiktoken.get_encoding("cl100k_base")
+        except Exception as exc:  # noqa: BLE001 —— 离线时取不到 BPE 词表
+            self.skipTest(f"cl100k_base 不可用（可能是离线）：{exc}")
+        for text in ("abcdefgh", "你好世界", "abc你好", "The quick brown fox."):
+            with self.subTest(text=text):
+                self.assertEqual(estimate_tokens(text), len(encoder.encode(text, disallowed_special=())))
 
     def test_multimodal_message_tokens(self):
         parts = [
             {"type": "text", "text": "你好"},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,xx"}},
         ]
-        self.assertEqual(message_tokens(parts), 2 + 1024)
-        self.assertEqual(message_tokens("你好"), 2)
+        with forced_heuristic():
+            self.assertEqual(message_tokens(parts), 2 + 1024)
+            self.assertEqual(message_tokens("你好"), 2)
 
 
 class TokenWindowTests(unittest.TestCase):
@@ -92,8 +150,6 @@ class SummaryAutoCompactTests(unittest.TestCase):
         self.assertIn("摘要", history[0]["content"])
         self.assertLessEqual(len(history) - 1, 2)
         # 关键不变量：token 上限必须真正生效（含摘要自身占用），keep_recent 只是软约束
-        from nanoagent.memory import estimate_tokens
-
         used = memory.tokens("s") + estimate_tokens(memory.summary("s"))
         self.assertLessEqual(used, 40, f"token 上限失效：实际占用 {used}")
 

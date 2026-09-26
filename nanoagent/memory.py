@@ -34,9 +34,24 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
                 pass
 
 
+def _heuristic_estimate(text: str) -> int:
+    """零依赖启发式 token 估算：ASCII 约 4 字符/token，CJK 等全角字符约 1 字符/token。
+
+    这是 `estimate_tokens` 在拿不到 tiktoken 时的兜底算法。单独拆成函数是为了让这条分支
+    在**任何环境**下都能被直接断言——否则它只在"没装 tiktoken"的机器上才跑到，
+    装了 tiktoken 的 CI 永远测不到它（历史 bug：本地过、CI 挂）。
+    """
+    if not text:
+        return 0
+    wide = sum(1 for ch in text if ord(ch) > 0x2E7F)  # CJK/全角区
+    return (len(text) - wide + 3) // 4 + wide
+
+
 def estimate_tokens(text: str) -> int:
-    """token 估算：装有 tiktoken 时用 cl100k_base 精确计数，否则零依赖启发式
-    （ASCII 约 4 字符/token，CJK 等全角字符约 1 字符/token）。
+    """token 估算：装有 tiktoken 时用 cl100k_base 精确计数，否则零依赖启发式。
+
+    注意**取值随环境而变**（CI 装了 tiktoken、开发机常常没装），所以断言具体数值的测试
+    必须先锁定走哪条路径，不要直接断言裸数字。
 
     用途是窗口裁剪的触发依据，不追求计费级精确。
     """
@@ -52,8 +67,7 @@ def estimate_tokens(text: str) -> int:
             return len(_TIKTOKEN_ENCODER.encode(text, disallowed_special=()))
         except Exception:  # noqa: BLE001 —— tiktoken 缺失/坏编码时回退启发式
             _TIKTOKEN_ENCODER = False
-    wide = sum(1 for ch in text if ord(ch) > 0x2E7F)  # CJK/全角区
-    return (len(text) - wide + 3) // 4 + wide
+    return _heuristic_estimate(text)
 
 
 _TIKTOKEN_ENCODER: Any = None  # None=未尝试；False=不可用；否则为编码器
