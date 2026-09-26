@@ -145,8 +145,10 @@ class CheckpointBackendTests(unittest.TestCase):
         self.assertEqual(backend.keys(), ["task"])
 
     def test_resolve_checkpoint_dispatch(self):
-        self.assertIsInstance(resolve_checkpoint("x.json"), JsonFileBackend)
-        self.assertIsInstance(resolve_checkpoint("x.db"), SQLiteBackend)
+        # 用临时目录，避免 SQLiteBackend 构造时在仓库 cwd 落下一个 x.db 残留
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsInstance(resolve_checkpoint(str(Path(tmp) / "x.json")), JsonFileBackend)
+            self.assertIsInstance(resolve_checkpoint(str(Path(tmp) / "x.db")), SQLiteBackend)
         backend = InMemoryBackend()
         self.assertIs(resolve_checkpoint(backend), backend)
 
