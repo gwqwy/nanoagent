@@ -111,8 +111,30 @@ _ACCUMULATE_LOCK = threading.Lock()
 
 def _accumulate(total: Dict[str, int], usage: Dict[str, int]) -> None:
     with _ACCUMULATE_LOCK:
-        for key in ("prompt_tokens", "completion_tokens"):
+        for key in ("prompt_tokens", "completion_tokens", "cached_tokens"):
             total[key] = total.get(key, 0) + (usage.get(key, 0) or 0)
+
+
+def _usage_dict(u: Any) -> Dict[str, int]:
+    """SDK 的 usage 对象 → 统一用量字典（含缓存命中字段，防御式提取）。
+
+    - DeepSeek 约定：``prompt_cache_hit_tokens`` / ``prompt_cache_miss_tokens``
+    - OpenAI 约定：``prompt_tokens_details.cached_tokens``
+    未知字段经 model_extra 也能被 getattr 读到；两套约定都归一到 ``cached_tokens``。
+    """
+    if not u:
+        return {}
+    usage: Dict[str, int] = {
+        "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
+        "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
+    }
+    hit = getattr(u, "prompt_cache_hit_tokens", None)
+    if hit is None:
+        details = getattr(u, "prompt_tokens_details", None)
+        hit = getattr(details, "cached_tokens", None) if details else None
+    if hit:
+        usage["cached_tokens"] = int(hit)
+    return usage
 
 
 class LLM:
@@ -163,7 +185,12 @@ class LLM:
             # 需在子类里去掉该参数。
             kwargs["stream_options"] = {"include_usage": True}
         if self.reasoning_effort:
-            kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
+            if self.reasoning_effort == "off":
+                # 显式关闭思考：Qwen/DashScope/vLLM 等常见 OpenAI 兼容端点的约定。
+                # 只留空不下发时，这些端点默认开思考——「思考模式关了还在深度思考」的根源。
+                kwargs["extra_body"] = {"enable_thinking": False}
+            else:
+                kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
         return kwargs
 
     def chat(self, messages: list, tools: list | None = None) -> LLMResponse:
@@ -182,12 +209,7 @@ class LLM:
             )
             for tc in (message.tool_calls or [])
         ]
-        usage = {}
-        if resp.usage:
-            usage = {
-                "prompt_tokens": resp.usage.prompt_tokens or 0,
-                "completion_tokens": resp.usage.completion_tokens or 0,
-            }
+        usage = _usage_dict(resp.usage)
         _accumulate(self.total_usage, usage)
         return LLMResponse(
             content=message.content or "", tool_calls=tool_calls, usage=usage,
@@ -211,13 +233,14 @@ class LLM:
         tool_calls_acc: Dict[int, dict] = {}
         usage: Dict[str, int] = {}
         for event in stream:
+            # usage 帧有两种形态都要接住：独立的无 choices 帧（OpenAI 官方），
+            # 以及挂在最后一个带 choices 帧上的 usage（部分网关如此——此前只认
+            # 前者，导致这些端点的 total_usage 恒为 0、用量统计全是 0）
+            event_usage = getattr(event, "usage", None)
+            if event_usage and (getattr(event_usage, "prompt_tokens", 0)
+                                or getattr(event_usage, "completion_tokens", 0)):
+                usage = _usage_dict(event_usage)
             if not getattr(event, "choices", None):
-                event_usage = getattr(event, "usage", None)
-                if event_usage:
-                    usage = {
-                        "prompt_tokens": event_usage.prompt_tokens or 0,
-                        "completion_tokens": event_usage.completion_tokens or 0,
-                    }
                 continue
             delta = event.choices[0].delta
             if delta is None:
@@ -322,7 +345,11 @@ class AsyncLLM:
             # 需在子类里去掉该参数。
             kwargs["stream_options"] = {"include_usage": True}
         if self.reasoning_effort:
-            kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
+            if self.reasoning_effort == "off":
+                # 显式关闭思考：同同步类（见上）
+                kwargs["extra_body"] = {"enable_thinking": False}
+            else:
+                kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
         return kwargs
 
     async def achat(self, messages: list, tools: list | None = None) -> LLMResponse:
@@ -341,12 +368,7 @@ class AsyncLLM:
             )
             for tc in (message.tool_calls or [])
         ]
-        usage = {}
-        if resp.usage:
-            usage = {
-                "prompt_tokens": resp.usage.prompt_tokens or 0,
-                "completion_tokens": resp.usage.completion_tokens or 0,
-            }
+        usage = _usage_dict(resp.usage)
         _accumulate(self.total_usage, usage)
         return LLMResponse(
             content=message.content or "", tool_calls=tool_calls, usage=usage,
@@ -370,13 +392,12 @@ class AsyncLLM:
         tool_calls_acc: Dict[int, dict] = {}
         usage: Dict[str, int] = {}
         async for event in stream:
+            # 同步版同款：两种 usage 帧形态都要接住（见同步版注释）
+            event_usage = getattr(event, "usage", None)
+            if event_usage and (getattr(event_usage, "prompt_tokens", 0)
+                                or getattr(event_usage, "completion_tokens", 0)):
+                usage = _usage_dict(event_usage)
             if not getattr(event, "choices", None):
-                event_usage = getattr(event, "usage", None)
-                if event_usage:
-                    usage = {
-                        "prompt_tokens": event_usage.prompt_tokens or 0,
-                        "completion_tokens": event_usage.completion_tokens or 0,
-                    }
                 continue
             delta = event.choices[0].delta
             if delta is None:
