@@ -14,10 +14,11 @@ MCP 工具的 inputSchema 直接就是 JSON Schema，无需再生成。
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .tools import Tool
+from .tools import Tool, sanitize_tool_name
 
 
 def mcp_schema_to_nanoagent(mcp_tool: Any) -> Tool:
@@ -26,15 +27,18 @@ def mcp_schema_to_nanoagent(mcp_tool: Any) -> Tool:
     mcp_tool 需要有 name / description 与入参 schema 属性
     （mcp 2.x 为 input_schema，1.x 为 inputSchema），缺失时按无参工具处理。
     返回的 Tool.func 只是占位，实际调用需经 MCPServer 转发（见 _bind）。
+    工具名经 sanitize_tool_name 净化（MCP 常见 `server.tool` 带点号名会被
+    OpenAI 兼容服务 400 拒绝）；原始名经 list_tools 传给 _bind 用于转发。
     """
     schema_obj = getattr(mcp_tool, "input_schema", None) or getattr(mcp_tool, "inputSchema", None)
     schema = dict(schema_obj or {})
     schema.setdefault("type", "object")
     schema.setdefault("properties", {})
     schema.setdefault("required", [])
+    raw_name = str(getattr(mcp_tool, "name", "") or "")
     return Tool(
-        name=mcp_tool.name,
-        description=(getattr(mcp_tool, "description", "") or f"MCP 工具 {mcp_tool.name}").strip(),
+        name=sanitize_tool_name(raw_name),
+        description=(getattr(mcp_tool, "description", "") or f"MCP 工具 {raw_name}").strip(),
         parameters=schema,
         func=_unbound_stub,
     )
@@ -167,7 +171,10 @@ class MCPServer:
         """拉取服务器工具清单，适配成已绑定转发的 nanoagent Tool 列表。"""
         self._ensure_connected()
         result = await self._session.list_tools()
-        return [self._bind(mcp_schema_to_nanoagent(t)) for t in result.tools]
+        return [
+            self._bind(mcp_schema_to_nanoagent(t), raw_name=str(getattr(t, "name", "") or ""))
+            for t in result.tools
+        ]
 
     async def tools(self) -> List[Tool]:
         """list_tools 的别名，语义上更贴近 Agent(tools=...) 的用法。"""
@@ -187,12 +194,17 @@ class MCPServer:
         return "".join(parts) or json.dumps({"ok": True}, ensure_ascii=False)
 
     # ------------------------------------------------------------------
-    def _bind(self, tool: Tool) -> Tool:
-        """给适配后的 Tool 绑上"转发到本服务器"的调用函数。"""
+    def _bind(self, tool: Tool, raw_name: str | None = None) -> Tool:
+        """给适配后的 Tool 绑上"转发到本服务器"的调用函数。
+
+        raw_name 是服务器侧的原始工具名：对外暴露的名字经过 sanitize
+        （OpenAI 兼容服务要求 ^[a-zA-Z0-9_-]+$），转发调用必须用原始名。
+        """
         server = self
+        server_side_name = raw_name or tool.name
 
         async def runner(**kwargs):
-            return await server.call(tool.name, kwargs)
+            return await server.call(server_side_name, kwargs)
 
         runner.__name__ = tool.name
         runner.__doc__ = tool.description
@@ -227,19 +239,27 @@ class MCPManager:
 
     # -- 配置持久化 -------------------------------------------------------
     def _load(self) -> None:
-        if self.config_path.is_file():
+        if not self.config_path.is_file():
+            return
+        try:
             data = json.loads(self.config_path.read_text(encoding="utf-8"))
-            servers = data.get("mcpServers")
-            if not isinstance(servers, dict):
-                raise ValueError(f"{self.config_path} 缺少 mcpServers 字段")
-            self.config = servers
+        except json.JSONDecodeError as exc:
+            # 损坏时明确报错而不是当空配置继续——否则后续 save 会把用户全部声明覆盖掉
+            raise ValueError(f"MCP 配置文件无法解析（{self.config_path}）: {exc}") from exc
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict):
+            raise ValueError(f"{self.config_path} 缺少 mcpServers 字段")
+        self.config = servers
 
     def _save(self) -> None:
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(
+        # 临时文件 + os.replace 原子替换：写一半崩溃不会留下半截 JSON
+        tmp = self.config_path.with_name(self.config_path.name + ".tmp")
+        tmp.write_text(
             json.dumps({"mcpServers": self.config}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        os.replace(tmp, self.config_path)
 
     # -- 安装 / 卸载 -------------------------------------------------------
     def add(self, name: str, command: str | None = None, args: Optional[List[str]] = None,

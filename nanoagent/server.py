@@ -171,9 +171,6 @@ def _version() -> str:
     return __version__
 
 
-app = create_app()
-
-
 if __name__ == "__main__":
     import sys
 
@@ -189,3 +186,13 @@ if __name__ == "__main__":
         )
         raise SystemExit(2)
     uvicorn.run("nanoagent.server:app", host=host, port=port)
+
+
+def __getattr__(name: str):
+    """惰性构建 `app`（PEP 562）：import 本模块不再创建 LLM 客户端/记忆/trace 文件，
+    `uvicorn nanoagent.server:app` 等属性访问时才真正构建一次并缓存。"""
+    if name == "app":
+        app = create_app()
+        globals()["app"] = app
+        return app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

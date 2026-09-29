@@ -150,5 +150,43 @@ class KnowledgeBaseTests(unittest.TestCase):
             self.assertGreater(len(reloaded.store), 0)
 
 
+class EmbeddingCacheTests(unittest.TestCase):
+    """向量缓存：内容寻址（sha256），重复入库命中缓存不再调 /embeddings。"""
+
+    class CountingLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def embeddings(self, texts, model=None):
+            self.calls += 1
+            return [[1.0, 0.0] for _ in texts]
+
+    def test_cache_hits_skip_embeddings_across_instances(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            llm = self.CountingLLM()
+            persist = Path(tmp) / "kb.json"
+            kb = KnowledgeBase(llm=llm, embedding_model="m", persist_path=persist)
+            kb.add_text("苹果是水果。")
+            calls_first = llm.calls
+            self.assertGreaterEqual(calls_first, 1)
+            self.assertTrue(Path(f"{persist}.veccache.json").is_file())
+            # 新实例（同 persist）：chunk 内容没变 → 全部命中缓存，零次 /embeddings
+            kb2 = KnowledgeBase(llm=llm, embedding_model="m", persist_path=persist)
+            kb2.add_text("苹果是水果。")
+            self.assertEqual(llm.calls, calls_first)
+
+    def test_cache_can_be_disabled(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            llm = self.CountingLLM()
+            kb = KnowledgeBase(llm=llm, embedding_model="m",
+                               persist_path=Path(tmp) / "kb.json", embedding_cache=False)
+            kb.add_text("苹果是水果。")
+            self.assertFalse(Path(f"{kb.persist_path}.veccache.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -288,6 +288,10 @@ class Workflow:
             session_id = session_id or state["session_id"]
             plan, code, review = state["plan"], state["code"], state["review"]
             passed, start_round = state["passed"], state["rounds_done"] + 1
+            if passed:
+                # 审计 N-07：checkpoint 在审查通过后落盘，恢复时直接进汇总，
+                # 不再多跑一轮（重跑会翻转审查结论并额外消耗 max_rounds 配额）。
+                start_round = self.max_rounds + 1
         else:
             session_id = session_id or f"wf-{uuid.uuid4().hex[:8]}"
             plan = self.planner.run(
@@ -300,7 +304,7 @@ class Workflow:
             self._persist(self._state(task, session_id, plan, 0, "", "", False))
 
         issues = review if review else "无（首次开发）"
-        rounds = start_round - 1
+        rounds = state["rounds_done"] if _resume is not None else 0
         for round_no in range(start_round, self.max_rounds + 1):
             rounds = round_no
             code = self.coder.run(
@@ -338,6 +342,9 @@ class Workflow:
             session_id = session_id or state["session_id"]
             plan, code, review = state["plan"], state["code"], state["review"]
             passed, start_round = state["passed"], state["rounds_done"] + 1
+            if passed:
+                # 审计 N-07：同 run() —— 已通过的 checkpoint 恢复直接进汇总
+                start_round = self.max_rounds + 1
         else:
             session_id = session_id or f"wf-{uuid.uuid4().hex[:8]}"
             plan = (await self.planner.arun(
@@ -350,7 +357,7 @@ class Workflow:
             self._persist(self._state(task, session_id, plan, 0, "", "", False))
 
         issues = review if review else "无（首次开发）"
-        rounds = start_round - 1
+        rounds = state["rounds_done"] if _resume is not None else 0
         for round_no in range(start_round, self.max_rounds + 1):
             rounds = round_no
             code = (await self.coder.arun(

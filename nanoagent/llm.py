@@ -90,6 +90,18 @@ class StreamResult:
             raise RuntimeError("StreamResult 未绑定生成器")
         return next(self._generator)
 
+    def close(self) -> None:
+        """提前终止：关闭底层生成器（未读完的 HTTP 流随之释放）。
+
+        bind 的对象未必是真生成器（测试常绑普通迭代器），无 close 时跳过。
+        """
+        gen, self._generator = self._generator, None
+        if gen is None:
+            return
+        close = getattr(gen, "close", None)
+        if callable(close):
+            close()
+
 
 async def _aretry(fn, max_retries: int, backoff: float):
     """_with_retry 的异步版。"""
@@ -295,6 +307,14 @@ class AsyncStreamResult:
         if self._agen is None:
             raise RuntimeError("AsyncStreamResult 未绑定生成器")
         return await self._agen.__anext__()
+
+    async def aclose(self) -> None:
+        """提前终止：关闭底层异步生成器（未读完的 HTTP 流随之释放）。"""
+        agen, self._agen = self._agen, None
+        if agen is not None:
+            aclose = getattr(agen, "aclose", None)
+            if callable(aclose):
+                await aclose()
 
 
 class AsyncLLM:

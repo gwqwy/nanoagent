@@ -22,18 +22,30 @@ class KnowledgeBase:
     两个后端的存档格式不同，切换后端后需重新入库。
     """
 
+    # 单次 /embeddings 请求的批量条数上限：大文件一次性全量入库容易超过
+    # 服务端的批量限制或单请求 token 上限，分批请求更稳
+    EMBED_BATCH = 64
+
     def __init__(
         self,
         llm: LLM | None = None,
         embedding_model: str | None = None,
         persist_path: str | Path | None = None,
         backend: str = "numpy",
+        embedding_cache: bool = True,
     ):
         self.llm = llm or LLM()
         self.embedding_model = embedding_model or settings()["embedding_model"]
         self.backend = backend
         self.store = create_store(backend)
         self.persist_path = Path(persist_path) if persist_path else None
+        # 向量缓存：chunk 内容哈希 → 向量。重复入库同一文件（内容没变的 chunk）
+        # 不再重扣 /embeddings 费用；有 persist_path 时缓存落盘、跨实例复用。
+        self.cache_path = (Path(f"{self.persist_path}.veccache.json")
+                           if self.persist_path and embedding_cache else None)
+        self._cache: dict = {}
+        if self.cache_path and self.cache_path.is_file():
+            self._load_vec_cache()
         if self.persist_path:
             if backend == "numpy" and self.persist_path.exists():
                 self.store = VectorStore.load(self.persist_path)
@@ -41,10 +53,59 @@ class KnowledgeBase:
                 self.store = type(self.store).load(self.persist_path)
 
     # ------------------------------------------------------------------
+    CACHE_LIMIT = 8000   # 缓存条数上限：超出即整体重建（chunks 是内容寻址的，重建无损）
+
+    def _load_vec_cache(self) -> None:
+        import json
+
+        try:
+            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            self._cache = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            self._cache = {}
+
+    def _save_vec_cache(self) -> None:
+        import json
+
+        if not self.cache_path:
+            return
+        if len(self._cache) > self.CACHE_LIMIT:
+            self._cache = {}
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_path.write_text(
+                json.dumps(self._cache, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass   # 缓存写不进去不影响入库主流程
+
+    @staticmethod
+    def _chunk_key(text: str) -> str:
+        import hashlib
+
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
     def _embed(self, texts: List[str]) -> np.ndarray:
         if not texts:
             return np.zeros((0, 1), dtype=np.float32)
-        vectors = self.llm.embeddings(texts, model=self.embedding_model)
+        # 命中缓存的 chunk 直接取向量，只把未命中的送去 /embeddings
+        keys = [self._chunk_key(t) for t in texts]
+        missing: list[int] = []
+        vectors: list[list[float] | None] = [None] * len(texts)
+        for i, key in enumerate(keys):
+            cached = self._cache.get(key)
+            if cached is not None:
+                vectors[i] = cached
+            else:
+                missing.append(i)
+        for start in range(0, len(missing), self.EMBED_BATCH):
+            idxs = missing[start:start + self.EMBED_BATCH]
+            batch = [texts[i] for i in idxs]
+            fresh = self.llm.embeddings(batch, model=self.embedding_model)
+            for i, vec in zip(idxs, fresh):
+                vectors[i] = vec
+                self._cache[keys[i]] = vec
+        if missing:
+            self._save_vec_cache()
         return np.asarray(vectors, dtype=np.float32)
 
     def add_text(self, text: str, metadata: Optional[dict] = None) -> int:

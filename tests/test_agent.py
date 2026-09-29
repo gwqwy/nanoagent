@@ -180,5 +180,104 @@ class AgentStreamTests(unittest.TestCase):
         self.assertEqual(result.reasoning, "先查天气\n\n汇总结果")
 
 
+class StreamStopTests(unittest.TestCase):
+    """should_stop 中断钩子：流式回复可被调用方请求停止（停止按钮的框架底座）。"""
+
+    def test_stop_mid_stream(self):
+        # "流式回答" 逐字吐出；第 2 个 delta 后请求停止 → 只收到 1 个 delta，无 done
+        agent = make_agent([text_response("流式回答")])
+        calls = {"n": 0}
+
+        def should_stop():
+            calls["n"] += 1
+            return calls["n"] > 2   # 循环开始 1 次 + 第 1 个 delta 前 1 次 = 2 次放行
+
+        events = list(agent.run_stream("测试", session_id="stop",
+                                       should_stop=should_stop))
+        self.assertEqual([e["type"] for e in events], ["delta"])
+        self.assertEqual(events[0]["text"], "流")
+        # 不写记忆：中断的回合不落盘（与消费方提前 break 的语义一致）
+        self.assertEqual(agent.memory.history("stop"), [])
+
+    def test_stop_immediately_yields_nothing(self):
+        agent = make_agent([text_response("不会出现")])
+        events = list(agent.run_stream("测试", should_stop=lambda: True))
+        self.assertEqual(events, [])
+        self.assertEqual(agent.memory.history("default"), [])
+
+    def test_stop_false_runs_to_completion(self):
+        agent = make_agent([text_response("完整回答")])
+        events = list(agent.run_stream("测试", session_id="ok",
+                                       should_stop=lambda: False))
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["result"].content, "完整回答")
+        self.assertEqual(len(agent.memory.history("ok")), 2)   # 正常落盘
+
+    def test_async_stream_stop(self):
+        import asyncio
+
+        async def main():
+            agent = make_agent([text_response("异步回答")])
+            # MockLLM 自带 achat/achat_stream（满足 _require_async_llm 协议），
+            # 这里只验证 should_stop 在异步路径同样生效。
+            calls = {"n": 0}
+
+            def should_stop():
+                calls["n"] += 1
+                return calls["n"] > 2
+
+            events = []
+            async for event in agent.arun_stream("测试", session_id="astop",
+                                                 should_stop=should_stop):
+                events.append(event)
+            return events
+
+        events = asyncio.run(main())
+        self.assertEqual([e["type"] for e in events], ["delta"])
+
+
+class ToolGateTests(unittest.TestCase):
+    """tool_gate 审批中间层：每次工具执行前过门，拦截信息回填给模型（fail-closed）。"""
+
+    def test_gate_allows_and_blocks(self):
+        agent = make_agent(
+            [
+                tool_response("g1", "get_weather", {"city": "北京"}),
+                text_response("好的，不查了。"),
+            ],
+            tool_gate=lambda name, args: "北京不让查" if args.get("city") == "北京" else None,
+        )
+        result = agent.run("查北京天气")
+        blocked = [t for t in result.tool_calls if "拒绝" in t["result"]]
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("北京不让查", blocked[0]["result"])
+        # 同一 agent 换放行的城市：门不拦截，工具真实执行
+        agent.llm.responses.extend(
+            [tool_response("g2", "get_weather", {"city": "上海"}), text_response("上海晴。")]
+        )
+        result2 = agent.run("查上海天气")
+        allowed = [t for t in result2.tool_calls if "晴" in t["result"]]
+        self.assertEqual(len(allowed), 1)
+
+    def test_gate_exception_fails_closed(self):
+        def boom(name, args):
+            raise RuntimeError("审批服务挂了")
+
+        agent = make_agent(
+            [tool_response("g1", "get_weather", {"city": "广州"}), text_response("收到。")],
+            tool_gate=boom,
+        )
+        result = agent.run("天气")
+        self.assertIn("审批回调异常", result.tool_calls[0]["result"])
+
+    def test_no_gate_runs_normally(self):
+        agent = make_agent(
+            [tool_response("g1", "get_weather", {"city": "深圳"}), text_response("深圳晴。")],
+            tool_gate=None,
+        )
+        result = agent.run("天气")
+        self.assertEqual(result.tool_calls[0]["result"], "深圳 晴 25℃")
+
+
 if __name__ == "__main__":
     unittest.main()

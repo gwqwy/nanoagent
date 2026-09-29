@@ -78,6 +78,7 @@ class Agent:
         input_guardrails: Optional[List[Any]] = None,
         output_guardrails: Optional[List[Any]] = None,
         memory_tool_traces: bool = False,
+        tool_gate: Optional[Callable[[str, dict], Any]] = None,
     ):
         if max_iterations < 1:
             raise ValueError("max_iterations 必须 >= 1")
@@ -106,6 +107,25 @@ class Agent:
         self.memory_tool_traces = memory_tool_traces
         self.skills = None  # enable_skills 后为 SkillRegistry
         self._skills_marker = "# 可用技能"
+        # 工具审批中间层：每次工具执行前调用 tool_gate(name, arguments)——
+        # 返回 None/True 放行；False 或字符串则拦截，字符串作为「拒绝原因」
+        # 回填给模型（工具结果以 tool role 返回，模型可据此换路或向用户说明）。
+        # 这是框架级 human-in-the-loop：宿主（CLI/桌面/库使用者）各接各的确认 UI。
+        self.tool_gate = tool_gate
+
+    def _apply_tool_gate(self, name: str, arguments: dict) -> str | None:
+        """过工具门：放行返回 None，拦截返回给模型看的错误文本（fail-closed）。"""
+        if self.tool_gate is None:
+            return None
+        try:
+            verdict = self.tool_gate(name, arguments)
+        except Exception as exc:  # noqa: BLE001 —— 审批回调本身出错按拒绝处理
+            return f"错误：工具 {name} 未获审批通过（审批回调异常: {type(exc).__name__}: {exc}）"
+        if verdict is None or verdict is True:
+            return None
+        if verdict is False:
+            return f"错误：工具 {name} 被审批层拒绝"
+        return f"错误：工具 {name} 被审批层拒绝：{verdict}"
 
     # ------------------------------------------------------------------
     def _record_turn(
@@ -215,7 +235,8 @@ class Agent:
 
     def _execute_one(self, tool_call: ToolCall) -> dict:
         started = time.perf_counter()
-        result = self.tools.execute(tool_call)
+        blocked = self._apply_tool_gate(tool_call.name, tool_call.arguments)
+        result = blocked if blocked is not None else self.tools.execute(tool_call)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         self.tracer.log(
             "tool_call",
@@ -232,7 +253,8 @@ class Agent:
 
     async def _aexecute_one(self, tool_call: ToolCall) -> dict:
         started = time.perf_counter()
-        result = await self.tools.aexecute(tool_call)
+        blocked = self._apply_tool_gate(tool_call.name, tool_call.arguments)
+        result = blocked if blocked is not None else await self.tools.aexecute(tool_call)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         self.tracer.log(
             "tool_call",
@@ -322,8 +344,11 @@ class Agent:
                     tool_log.append(record)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": record["result"]})
             else:
-                # 达到迭代上限仍未给出最终回答，把最后一次输出直接返回
-                final_content = response.content
+                # 达到迭代上限仍未给出最终回答：最后一轮通常仍是 tool_calls，
+                # content 常为空串——空串写进记忆、再进结构化解析都是垃圾，留明确标记
+                final_content = response.content or (
+                    f"（未产出最终回答：已达 max_iterations={self.max_iterations} 上限，"
+                    "最后一轮仍在请求工具调用）")
                 messages.append({"role": "assistant", "content": final_content})
             self._guard_output(final_content)
 
@@ -342,6 +367,8 @@ class Agent:
                             messages.extend(self._structure_prompt(final_content, error))
                             retry = self.llm.chat(messages)
                             final_content = retry.content
+                            for key in usage_total:
+                                usage_total[key] += retry.usage.get(key, 0)
                             messages.append({"role": "assistant", "content": final_content})
                 if output is None:
                     self.tracer.log("structure_failed", error=error)
@@ -368,12 +395,17 @@ class Agent:
         save: bool = True,
         images: Optional[List[Any]] = None,
         image_detail: Optional[str] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Generator[dict, None, None]:
         """流式版 agent loop，产出事件字典：
 
         {"type": "delta", "text": ...}       —— 模型文本增量
         {"type": "tool_call", name, arguments, result} —— 一次工具调用完成
         {"type": "done", result: AgentResult} —— 结束，携带完整结果
+
+        should_stop: 可选中止钩子（返回 True 即请求停止）。在每轮开始与每个
+        delta 之间检查；命中后关闭底层流并直接返回——不再产出 done、不写
+        记忆、不跑输出护栏（部分生成的内容按调用方要求丢弃）。
         """
         self.tracer.start_run(self.name)
         user_input = self._guard_input(user_input)
@@ -383,15 +415,35 @@ class Agent:
         final_content = ""
         reasoning_parts: List[str] = []
         iterations = 0
+        # 审计 N-05：输出护栏开启时事件先缓冲、护栏通过后再统一放行——
+        # 否则 delta 已流出，事后拦截只能拦 done 与记忆，拦不回已下发的内容。
+        defer_output = not self.guardrails.is_empty() and bool(self.guardrails.output)
+        deferred: List[dict] = []
+        stopped = False
 
         try:
             for i in range(self.max_iterations):
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    break
                 iterations = i + 1
                 stream = self.llm.chat_stream(messages, tools=self.tools.schemas() or None)
                 parts: List[str] = []
                 for text in stream:
+                    if should_stop is not None and should_stop():
+                        stopped = True
+                        break
                     parts.append(text)
-                    yield {"type": "delta", "text": text}
+                    event = {"type": "delta", "text": text}
+                    if defer_output:
+                        deferred.append(event)
+                    else:
+                        yield event
+                if stopped:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
+                    break
                 response = stream.response or LLMResponse(content="".join(parts))
                 for key in usage_total:
                     usage_total[key] += response.usage.get(key, 0)
@@ -421,19 +473,31 @@ class Agent:
                 for tc, record in zip(response.tool_calls, self._execute_tool_calls(response.tool_calls)):
                     tool_log.append(record)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": record["result"]})
-                    yield {
+                    event = {
                         "type": "tool_call",
                         "name": record["name"],
                         "arguments": record["arguments"],
                         "result": record["result"],
                     }
+                    if defer_output:
+                        deferred.append(event)
+                    else:
+                        yield event
             else:
-                final_content = response.content
+                final_content = response.content or (
+                    f"（未产出最终回答：已达 max_iterations={self.max_iterations} 上限，"
+                    "最后一轮仍在请求工具调用）")
                 messages.append({"role": "assistant", "content": final_content})
-            self._guard_output(final_content)
+            if not stopped:
+                self._guard_output(final_content)
+                if defer_output:
+                    for event in deferred:
+                        yield event
         finally:
             self.tracer.end_run(iterations=iterations)
 
+        if stopped:
+            return
         if save:
             self._record_turn(session_id, user_input, final_content, tool_log)
         result = AgentResult(
@@ -505,7 +569,9 @@ class Agent:
                     tool_log.append(record)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": record["result"]})
             else:
-                final_content = response.content
+                final_content = response.content or (
+                    f"（未产出最终回答：已达 max_iterations={self.max_iterations} 上限，"
+                    "最后一轮仍在请求工具调用）")
                 messages.append({"role": "assistant", "content": final_content})
 
             await self._aguard_output(final_content)
@@ -522,6 +588,8 @@ class Agent:
                             messages.extend(self._structure_prompt(final_content, error))
                             retry = await self.llm.achat(messages)
                             final_content = retry.content
+                            for key in usage_total:
+                                usage_total[key] += retry.usage.get(key, 0)
                             messages.append({"role": "assistant", "content": final_content})
                 if output is None:
                     self.tracer.log("structure_failed", error=error)
@@ -548,8 +616,9 @@ class Agent:
         save: bool = True,
         images: Optional[List[Any]] = None,
         image_detail: Optional[str] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Generator[dict, None, None]:
-        """run_stream 的异步版，事件格式与同步版一致。"""
+        """run_stream 的异步版，事件格式与同步版一致；should_stop 语义亦相同。"""
         self._require_async_llm()
         self.tracer.start_run(self.name)
         user_input = await self._aguard_input(user_input)
@@ -560,15 +629,34 @@ class Agent:
         reasoning_parts: List[str] = []
         iterations = 0
         output = None
+        # 审计 N-05：与 run_stream 相同——输出护栏开启时先缓冲事件再放行
+        defer_output = not self.guardrails.is_empty() and bool(self.guardrails.output)
+        deferred: List[dict] = []
+        stopped = False
 
         try:
             for i in range(self.max_iterations):
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    break
                 iterations = i + 1
                 stream = await self.llm.achat_stream(messages, tools=self.tools.schemas() or None)
                 parts: List[str] = []
                 async for text in stream:
+                    if should_stop is not None and should_stop():
+                        stopped = True
+                        break
                     parts.append(text)
-                    yield {"type": "delta", "text": text}
+                    event = {"type": "delta", "text": text}
+                    if defer_output:
+                        deferred.append(event)
+                    else:
+                        yield event
+                if stopped:
+                    aclose = getattr(stream, "aclose", None)
+                    if callable(aclose):
+                        await aclose()
+                    break
                 response = stream.response or LLMResponse(content="".join(parts))
                 for key in usage_total:
                     usage_total[key] += response.usage.get(key, 0)
@@ -600,37 +688,51 @@ class Agent:
                 ):
                     tool_log.append(record)
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": record["result"]})
-                    yield {
+                    event = {
                         "type": "tool_call",
                         "name": record["name"],
                         "arguments": record["arguments"],
                         "result": record["result"],
                     }
+                    if defer_output:
+                        deferred.append(event)
+                    else:
+                        yield event
             else:
-                final_content = response.content
+                final_content = response.content or (
+                    f"（未产出最终回答：已达 max_iterations={self.max_iterations} 上限，"
+                    "最后一轮仍在请求工具调用）")
                 messages.append({"role": "assistant", "content": final_content})
 
-            await self._aguard_output(final_content)
-            if self.response_model is not None:
-                error = None
-                for attempt in range(2):
-                    try:
-                        output = self._try_parse_output(final_content)
-                        break
-                    except Exception as exc:  # noqa: BLE001
-                        error = f"{type(exc).__name__}: {exc}"
-                        if attempt == 0:
-                            self.tracer.log("structure_retry", error=error)
-                            messages.extend(self._structure_prompt(final_content, error))
-                            retry = await self.llm.achat(messages)
-                            final_content = retry.content
-                            messages.append({"role": "assistant", "content": final_content})
-                if output is None:
-                    self.tracer.log("structure_failed", error=error)
-                    raise OutputValidationError(f"结构化输出在重试后仍失败，最后一次错误: {error}")
+            if not stopped:
+                await self._aguard_output(final_content)
+                if defer_output:
+                    for event in deferred:
+                        yield event
+                if self.response_model is not None:
+                    error = None
+                    for attempt in range(2):
+                        try:
+                            output = self._try_parse_output(final_content)
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            error = f"{type(exc).__name__}: {exc}"
+                            if attempt == 0:
+                                self.tracer.log("structure_retry", error=error)
+                                messages.extend(self._structure_prompt(final_content, error))
+                                retry = await self.llm.achat(messages)
+                                final_content = retry.content
+                                for key in usage_total:
+                                    usage_total[key] += retry.usage.get(key, 0)
+                                messages.append({"role": "assistant", "content": final_content})
+                    if output is None:
+                        self.tracer.log("structure_failed", error=error)
+                        raise OutputValidationError(f"结构化输出在重试后仍失败，最后一次错误: {error}")
         finally:
             self.tracer.end_run(iterations=iterations)
 
+        if stopped:
+            return
         if save:
             self._record_turn(session_id, user_input, final_content, tool_log)
         yield {
