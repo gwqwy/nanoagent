@@ -39,6 +39,7 @@ from .llm import (
     _accumulate,
     _with_retry,
     parse_tool_arguments,
+    parse_tool_arguments_ex,
 )
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -222,11 +223,13 @@ def finalize_stream(state: Dict[str, Any]) -> LLMResponse:
         entry["text"] for _index, entry in sorted(state["blocks"].items())
         if entry["kind"] == "text"
     )
-    tool_calls = [
-        ToolCall(id=entry["id"], name=entry["name"], arguments=parse_tool_arguments(entry["args"]))
-        for _index, entry in sorted(state["blocks"].items())
-        if entry["kind"] == "tool_use"
-    ]
+    tool_calls = []
+    for _index, entry in sorted(state["blocks"].items()):
+        if entry["kind"] != "tool_use":
+            continue
+        args, arg_err = parse_tool_arguments_ex(entry["args"])
+        tool_calls.append(ToolCall(id=entry["id"], name=entry["name"],
+                                   arguments=args, arguments_error=arg_err))
     return LLMResponse(content=content, tool_calls=tool_calls, usage=state.get("usage", {}))
 
 

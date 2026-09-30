@@ -128,6 +128,18 @@ class EnableSkillsTests(unittest.TestCase):
         registry = SkillRegistry()
         self.assertIs(registry.use_skill_tool(), registry.use_skill_tool())
 
+    def test_remove_by_name(self):
+        """remove：按名移除（用户禁用技能），重复移除返回 False。"""
+        registry = SkillRegistry()
+        registry.add(Skill(name="a", description="", body="x"))
+        registry.add(Skill(name="b", description="", body="y"))
+        self.assertTrue(registry.remove("a"))
+        self.assertNotIn("a", registry)
+        self.assertIn("b", registry)
+        self.assertFalse(registry.remove("a"))  # 已不存在
+        with self.assertRaises(KeyError):
+            registry.load("a")
+
 
 if __name__ == "__main__":
     unittest.main()

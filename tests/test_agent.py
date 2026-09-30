@@ -279,5 +279,60 @@ class ToolGateTests(unittest.TestCase):
         self.assertEqual(result.tool_calls[0]["result"], "深圳 晴 25℃")
 
 
+class Batch44NanoTests(unittest.TestCase):
+    """第四十四批：非流式取消 / 工具超时 / 输出限幅 / 坏参数自修。"""
+
+    def test_run_should_stop(self):
+        agent = make_agent([text_response("不会出现")])
+        result = agent.run("测试", session_id="ns", should_stop=lambda: True)
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.content, "")
+        self.assertEqual(agent.memory.history("ns"), [])   # 不落盘
+
+    def test_run_should_stop_false_completes(self):
+        agent = make_agent([text_response("完整回答")])
+        result = agent.run("测试", session_id="ns2", should_stop=lambda: False)
+        self.assertFalse(result.stopped)
+        self.assertEqual(result.content, "完整回答")
+
+    def test_tool_timeout_sync(self):
+        import time as _time
+
+        @tool
+        def slow_tool() -> str:
+            """故意慢。"""
+            _time.sleep(1.2)
+            return "终于完成"
+
+        agent = make_agent(
+            [tool_response("t1", "slow_tool", {}), text_response("收到")],
+            tools=[get_weather, slow_tool],
+            tool_timeout=0.2,
+        )
+        result = agent.run("跑")
+        self.assertIn("超过 0.2 秒", result.tool_calls[0]["result"])
+
+    def test_tool_output_limit(self):
+        agent = make_agent(
+            [tool_response("t1", "get_weather", {"city": "北京"}), text_response("好")],
+            tool_output_limit=4,
+        )
+        result = agent.run("天气")
+        self.assertIn("输出已截断", result.tool_calls[0]["result"])
+        self.assertTrue(result.tool_calls[0]["result"].startswith("北京 晴"))
+
+    def test_bad_arguments_json_self_correct(self):
+        from nanoagent.llm import LLMResponse, ToolCall
+
+        broken = LLMResponse(content="", tool_calls=[
+            ToolCall(id="b1", name="get_weather", arguments={},
+                     arguments_error="参数不是合法 JSON（ Expecting value，位置 0）")])
+        agent = make_agent([broken, text_response("明白，重试")])
+        result = agent.run("天气")
+        # 工具未被真实执行；根因回填给模型
+        self.assertIn("参数无法解析", result.tool_calls[0]["result"])
+        self.assertIn("请修正参数", result.tool_calls[0]["result"])
+
+
 if __name__ == "__main__":
     unittest.main()

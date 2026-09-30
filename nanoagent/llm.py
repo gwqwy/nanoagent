@@ -48,6 +48,24 @@ def parse_tool_arguments(raw: str | None) -> dict:
     return args if isinstance(args, dict) else {}
 
 
+def parse_tool_arguments_ex(raw: str | None) -> tuple[dict, str]:
+    """parse_tool_arguments 的带根因版：(参数, 解析错误)。
+
+    raw 非法时返回 ({}, 错误说明)——调用方把错误回填给模型，模型下一轮
+    能自己修正参数（此前静默按空参数执行，模型不知道自己写坏了）。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return {}, ""
+    try:
+        args = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return {}, f"参数不是合法 JSON（{exc.msg}，位置 {exc.pos}）"
+    if not isinstance(args, dict):
+        return {}, f"参数应为 JSON 对象，实际是 {type(args).__name__}"
+    return args, ""
+
+
 @dataclass
 class ToolCall:
     """一次工具调用请求（由模型发起）。"""
@@ -55,6 +73,7 @@ class ToolCall:
     id: str
     name: str
     arguments: dict = field(default_factory=dict)
+    arguments_error: str = ""   # 参数 JSON 解析失败的原因（agent 侧据此拒绝执行并回填）
 
 
 @dataclass
@@ -213,14 +232,11 @@ class LLM:
             self.max_retries, self.retry_backoff,
         )
         message = resp.choices[0].message
-        tool_calls = [
-            ToolCall(
-                id=tc.id,
-                name=tc.function.name,
-                arguments=parse_tool_arguments(tc.function.arguments),
-            )
-            for tc in (message.tool_calls or [])
-        ]
+        tool_calls = []
+        for tc in (message.tool_calls or []):
+            args, arg_err = parse_tool_arguments_ex(tc.function.arguments)
+            tool_calls.append(ToolCall(id=tc.id, name=tc.function.name,
+                                       arguments=args, arguments_error=arg_err))
         usage = _usage_dict(resp.usage)
         _accumulate(self.total_usage, usage)
         return LLMResponse(
@@ -272,10 +288,11 @@ class LLM:
                     acc["name"] += tc.function.name
                 if tc.function and tc.function.arguments:
                     acc["args"] += tc.function.arguments
-        tool_calls = [
-            ToolCall(id=acc["id"], name=acc["name"], arguments=parse_tool_arguments(acc["args"]))
-            for acc in tool_calls_acc.values()
-        ]
+        tool_calls = []
+        for acc in tool_calls_acc.values():
+            args, arg_err = parse_tool_arguments_ex(acc["args"])
+            tool_calls.append(ToolCall(id=acc["id"], name=acc["name"],
+                                       arguments=args, arguments_error=arg_err))
         _accumulate(self.total_usage, usage)
         result.response = LLMResponse(
             content="".join(content_parts), tool_calls=tool_calls, usage=usage,
@@ -380,14 +397,11 @@ class AsyncLLM:
             self.max_retries, self.retry_backoff,
         )
         message = resp.choices[0].message
-        tool_calls = [
-            ToolCall(
-                id=tc.id,
-                name=tc.function.name,
-                arguments=parse_tool_arguments(tc.function.arguments),
-            )
-            for tc in (message.tool_calls or [])
-        ]
+        tool_calls = []
+        for tc in (message.tool_calls or []):
+            args, arg_err = parse_tool_arguments_ex(tc.function.arguments)
+            tool_calls.append(ToolCall(id=tc.id, name=tc.function.name,
+                                       arguments=args, arguments_error=arg_err))
         usage = _usage_dict(resp.usage)
         _accumulate(self.total_usage, usage)
         return LLMResponse(
@@ -437,10 +451,11 @@ class AsyncLLM:
                     acc["name"] += tc.function.name
                 if tc.function and tc.function.arguments:
                     acc["args"] += tc.function.arguments
-        tool_calls = [
-            ToolCall(id=acc["id"], name=acc["name"], arguments=parse_tool_arguments(acc["args"]))
-            for acc in tool_calls_acc.values()
-        ]
+        tool_calls = []
+        for acc in tool_calls_acc.values():
+            args, arg_err = parse_tool_arguments_ex(acc["args"])
+            tool_calls.append(ToolCall(id=acc["id"], name=acc["name"],
+                                       arguments=args, arguments_error=arg_err))
         _accumulate(self.total_usage, usage)
         result.response = LLMResponse(
             content="".join(content_parts), tool_calls=tool_calls, usage=usage,

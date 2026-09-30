@@ -56,7 +56,8 @@ class AgentResult:
     iterations: int = 0
     usage: Dict[str, int] = field(default_factory=dict)
     output: Any = None
-    reasoning: str = ""  # 思考过程（多轮工具调用时按顺序拼接）  # response_model 校验通过后的结构化对象（未启用时为 None）
+    reasoning: str = ""  # 思考过程（多轮工具调用时按顺序拼接）
+    stopped: bool = False  # should_stop 中止时为 True（部分轮次已执行，内容不完整）  # response_model 校验通过后的结构化对象（未启用时为 None）
 
 
 class Agent:
@@ -79,6 +80,8 @@ class Agent:
         output_guardrails: Optional[List[Any]] = None,
         memory_tool_traces: bool = False,
         tool_gate: Optional[Callable[[str, dict], Any]] = None,
+        tool_timeout: Optional[float] = None,
+        tool_output_limit: Optional[int] = None,
     ):
         if max_iterations < 1:
             raise ValueError("max_iterations 必须 >= 1")
@@ -112,6 +115,11 @@ class Agent:
         # 回填给模型（工具结果以 tool role 返回，模型可据此换路或向用户说明）。
         # 这是框架级 human-in-the-loop：宿主（CLI/桌面/库使用者）各接各的确认 UI。
         self.tool_gate = tool_gate
+        # 工具执行超时（秒）：None=不限。超时返回错误给模型（工具可能仍在后台
+        # 跑完——同步路径用线程等待实现，无法强杀；这是框架的已知边界）。
+        self.tool_timeout = tool_timeout
+        # 工具输出限幅（字符）：None=不限。超限截断并附提示，防任何插件撑爆上下文。
+        self.tool_output_limit = tool_output_limit
 
     def _apply_tool_gate(self, name: str, arguments: dict) -> str | None:
         """过工具门：放行返回 None，拦截返回给模型看的错误文本（fail-closed）。"""
@@ -126,6 +134,15 @@ class Agent:
         if verdict is False:
             return f"错误：工具 {name} 被审批层拒绝"
         return f"错误：工具 {name} 被审批层拒绝：{verdict}"
+
+    def _limit_output(self, result: str) -> str:
+        """工具输出限幅：超长截断并提示（模型可分次读取或缩小请求范围）。"""
+        text = str(result or "")
+        if self.tool_output_limit is None or len(text) <= self.tool_output_limit:
+            return text
+        return (text[: self.tool_output_limit]
+                + f"\n…（输出已截断：原长 {len(text)} 字符，仅显示前 {self.tool_output_limit}。"
+                  "请缩小请求范围或分段获取。）")
 
     # ------------------------------------------------------------------
     def _record_turn(
@@ -233,10 +250,37 @@ class Agent:
         tool = self.tools.get(name)
         return True if tool is None else bool(getattr(tool, "thread_safe", True))
 
+    def _run_with_timeout(self, fn):
+        """带超时执行同步工具（tool_timeout=None 时直接调用）。"""
+        import concurrent.futures
+
+        if self.tool_timeout is None:
+            return fn()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(fn)
+            try:
+                return future.result(timeout=self.tool_timeout)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                raise TimeoutError(
+                    f"工具执行超过 {self.tool_timeout} 秒（可能卡死；结果不可信，请换路或重试）"
+                ) from None
+
     def _execute_one(self, tool_call: ToolCall) -> dict:
         started = time.perf_counter()
         blocked = self._apply_tool_gate(tool_call.name, tool_call.arguments)
-        result = blocked if blocked is not None else self.tools.execute(tool_call)
+        if blocked is not None:
+            result = blocked            # 审批层拦截：不执行工具，原因回填模型
+        elif tool_call.arguments_error:
+            result = (f"错误：工具 {tool_call.name} 的参数无法解析——{tool_call.arguments_error}。"
+                      "请修正参数后重新调用。")   # 坏 JSON 自我修正：根因回填而非静默空参
+        else:
+            try:
+                result = self._run_with_timeout(
+                    lambda: self.tools.execute(tool_call))
+            except TimeoutError as exc:
+                result = f"错误：{exc}"
+        result = self._limit_output(result)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         self.tracer.log(
             "tool_call",
@@ -254,7 +298,21 @@ class Agent:
     async def _aexecute_one(self, tool_call: ToolCall) -> dict:
         started = time.perf_counter()
         blocked = self._apply_tool_gate(tool_call.name, tool_call.arguments)
-        result = blocked if blocked is not None else await self.tools.aexecute(tool_call)
+        if blocked is not None:
+            result = blocked
+        elif tool_call.arguments_error:
+            result = (f"错误：工具 {tool_call.name} 的参数无法解析——{tool_call.arguments_error}。"
+                      "请修正参数后重新调用。")
+        else:
+            try:
+                if self.tool_timeout is not None:
+                    result = await asyncio.wait_for(
+                        self.tools.aexecute(tool_call), timeout=self.tool_timeout)
+                else:
+                    result = await self.tools.aexecute(tool_call)
+            except (asyncio.TimeoutError, TimeoutError):
+                result = f"错误：工具执行超过 {self.tool_timeout} 秒（可能卡死；结果不可信，请换路或重试）"
+        result = self._limit_output(result)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         self.tracer.log(
             "tool_call",
@@ -295,11 +353,15 @@ class Agent:
         save: bool = True,
         images: Optional[List[Any]] = None,
         image_detail: Optional[str] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> AgentResult:
         """执行 agent loop，返回最终回答。
 
         images: 图片源列表（http(s) URL / 本地路径 / bytes / 已构造的 part dict），
         传入后 user 消息升级为多模态 content 数组；记忆只持久化文本部分。
+        should_stop: 可选中止钩子——每轮循环开始前检查，命中即停（返回的
+        AgentResult.stopped=True，内容为空、不写记忆、不做结构化解析；
+        流式路径用 run_stream 的同名参数可保留部分内容）。
         """
         self.tracer.start_run(self.name)
         user_input = self._guard_input(user_input)
@@ -313,6 +375,11 @@ class Agent:
 
         try:
             for i in range(self.max_iterations):
+                if should_stop is not None and should_stop():
+                    # 非流式中止：返回 stopped 标记（内容为空、不写记忆、不解析）
+                    return AgentResult(content="", tool_calls=tool_log,
+                                       iterations=iterations, usage=usage_total,
+                                       reasoning="\n\n".join(reasoning_parts), stopped=True)
                 iterations = i + 1
                 response = self.llm.chat(messages, tools=self.tools.schemas() or None)
                 for key in usage_total:
@@ -517,6 +584,7 @@ class Agent:
         save: bool = True,
         images: Optional[List[Any]] = None,
         image_detail: Optional[str] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> AgentResult:
         """run 的异步版：需要 llm 为 AsyncLLM（或任何提供 achat 的客户端）。
 
@@ -536,6 +604,10 @@ class Agent:
 
         try:
             for i in range(self.max_iterations):
+                if should_stop is not None and should_stop():
+                    return AgentResult(content="", tool_calls=tool_log,
+                                       iterations=iterations, usage=usage_total,
+                                       reasoning="\n\n".join(reasoning_parts), stopped=True)
                 iterations = i + 1
                 response = await self.llm.achat(messages, tools=self.tools.schemas() or None)
                 for key in usage_total:

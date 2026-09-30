@@ -24,12 +24,27 @@ from .tools import tool as tool_decorator
 SKILL_FILE = "SKILL.md"
 
 _FRONTMATTER_LINE = re.compile(r"^([A-Za-z_][\w-]*)\s*:\s*(.*)$")
+_BLOCK_SCALAR = re.compile(r"^([>|][+-]?)\s*$")
+
+
+def _fold_lines(chunk: List[str], folded: bool) -> str:
+    """把块标量的行拼成字符串：folded(>) 用空格折叠、空行变段落换行；literal(|) 保留换行。"""
+    if not folded:
+        return "\n".join(chunk)
+    paras: List[List[str]] = [[]]
+    for part in chunk:
+        if part:
+            paras[-1].append(part)
+        elif paras[-1]:
+            paras.append([])
+    return "\n".join(" ".join(p) for p in paras if p)
 
 
 def parse_frontmatter(text: str) -> Tuple[Dict[str, str], str]:
     """解析 markdown 头部的 `--- ... ---` frontmatter。
 
-    只支持 `key: value` 简单格式（值两侧引号会被剥掉），不引入 YAML 依赖；
+    支持 `key: value` 单行格式与 YAML 块标量（`>` 折叠 / `|` 保留，含 +/- chomping）；
+    嵌套结构（如 metadata:）整体跳过不展开。值两侧引号会被剥掉，不引入 YAML 依赖；
     没有 frontmatter 或格式不完整时返回 ({}, 全文)。
     """
     text = text.strip()
@@ -37,14 +52,43 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, str], str]:
         return {}, text
     lines = text.splitlines()
     for i in range(1, len(lines)):
-        if lines[i].strip() == "---":
-            meta: Dict[str, str] = {}
-            for line in lines[1:i]:
-                match = _FRONTMATTER_LINE.match(line.strip())
-                if match:
-                    value = match.group(2).strip().strip("'\"").strip()
-                    meta[match.group(1)] = value
-            return meta, "\n".join(lines[i + 1 :]).strip()
+        if lines[i].strip() != "---":
+            continue
+        meta: Dict[str, str] = {}
+        body = lines[1:i]
+        k = 0
+        while k < len(body):
+            line = body[k]
+            k += 1
+            match = _FRONTMATTER_LINE.match(line.strip())
+            if not match:
+                continue
+            key, value = match.group(1), match.group(2).strip()
+            indent = len(line) - len(line.lstrip())
+            block = _BLOCK_SCALAR.match(value)
+            if block or value == "":
+                # 块标量：收集缩进更深的行；空值（嵌套结构）：跳过缩进子行
+                chunk: List[str] = []
+                while k < len(body):
+                    nxt = body[k]
+                    if nxt.strip() == "":
+                        if block:
+                            chunk.append("")
+                        k += 1
+                        continue
+                    if len(nxt) - len(nxt.lstrip()) <= indent:
+                        break
+                    if block:
+                        chunk.append(nxt.strip())
+                    k += 1
+                while chunk and chunk[-1] == "":
+                    chunk.pop()
+                if block:
+                    meta[key] = _fold_lines(chunk, value.startswith(">"))
+                # 空值且非块标量 → 嵌套 dict，忽略
+            else:
+                meta[key] = value.strip("'\"").strip()
+        return meta, "\n".join(lines[i + 1 :]).strip()
     return {}, text  # 只有开头 --- 没有收尾，按无 frontmatter 处理
 
 
@@ -96,6 +140,10 @@ class SkillRegistry:
             for path in sorted(root.rglob(SKILL_FILE)):
                 loaded.append(self.add_file(path))
         return loaded
+
+    def remove(self, name: str) -> bool:
+        """按名移除一个技能（用户禁用技能时用）；不存在返回 False。"""
+        return self._skills.pop(name, None) is not None
 
     # ------------------------------------------------------------------
     def names(self) -> List[str]:

@@ -18,12 +18,17 @@
 
 from __future__ import annotations
 
+import html as _html_mod
 import json
 import re as _re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, List, Optional
+
+
+def _html_esc(s: str) -> str:
+    return _html_mod.escape(str(s or ""))
 
 
 class EvalResult:
@@ -104,6 +109,37 @@ class EvalReport:
             "pass_rate": self.pass_rate,
             "cases": [c.to_dict() for c in self.cases],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
+    def save_html(self, path: str | Path) -> Path:
+        """导出单文件 HTML 报告（无依赖、浏览器直接打开、可分享）。"""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = []
+        for c in self.cases:
+            mark = "✓" if c.passed else "✗"
+            color = "#5cc689" if c.passed else "#ef7b6d"
+            note = c.error or c.reason
+            rows.append(
+                f"<tr><td>{_html_esc(c.case_name)}</td>"
+                f"<td style='color:{color};font-weight:700'>{mark} {c.score:g}</td>"
+                f"<td>{c.elapsed_ms}ms</td><td>{_html_esc(note)}</td></tr>")
+        rate = f"{self.pass_rate:.0%}"
+        path.write_text(
+            "<!DOCTYPE html><html lang='zh'><meta charset='utf-8'>"
+            "<title>nanoagent 评估报告</title><style>"
+            "body{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:#0f172a;"
+            "color:#e2e8f0;max-width:860px;margin:24px auto;padding:0 16px}"
+            "h1{font-size:20px} .stat{color:#94a3b8;font-size:13px;margin-bottom:14px}"
+            "table{width:100%;border-collapse:collapse;font-size:13.5px;background:#1e293b;"
+            "border-radius:10px;overflow:hidden}"
+            "th,td{padding:7px 12px;text-align:left;border-bottom:1px solid #334155}"
+            "th{background:#0b1220;color:#94a3b8;font-weight:600}"
+            "</style><h1>评估报告</h1>"
+            f"<div class='stat'>通过率 {rate}（{sum(1 for c in self.cases if c.passed)}/"
+            f"{len(self.cases)}）· 总耗时 {self.total_elapsed_ms}ms</div>"
+            "<table><tr><th>用例</th><th>得分</th><th>耗时</th><th>说明</th></tr>"
+            + "".join(rows) + "</table>", encoding="utf-8")
         return path
 
 

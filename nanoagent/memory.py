@@ -154,6 +154,23 @@ class Memory:
         """返回指定会话的消息副本（去掉内部时间戳字段）。"""
         return [{"role": m["role"], "content": m["content"]} for m in self._sessions.get(session_id, [])]
 
+    def fork(self, session_id: str, new_session_id: str | None = None) -> str:
+        """把一个会话的历史复制到新会话（会话分支的模型侧底座），返回新会话 id。
+
+        摘要类子类（SummaryMemory）只复制消息列表、不复制摘要——新分支从
+        完整消息重新积累，行为可预期。
+        """
+        if not new_session_id:
+            import uuid
+
+            new_session_id = f"{session_id}-fork-{uuid.uuid4().hex[:6]}"
+        with self._lock:
+            history = self._sessions.get(session_id)
+            if not history:
+                raise KeyError(f"会话不存在或为空: {session_id}")
+            self._sessions[new_session_id] = [dict(m) for m in history]
+        return new_session_id
+
     def clear(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
 
