@@ -4,6 +4,7 @@ loop 逻辑（与所有主流框架同构）：
     1. 组装 messages = [system] + 历史记忆 + 本次输入
     2. 调用 LLM，若返回 tool_calls 则逐个执行、把结果回填给模型
     3. 重复直到模型给出最终回答，或达到 max_iterations 防死循环上限
+       （max_iterations=None 表示无上限，靠模型收敛或宿主 should_stop 中止）
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ class Agent:
         llm: LLM | None = None,
         tools: Optional[List[Callable]] = None,
         memory: Memory | None = None,
-        max_iterations: int = 10,
+        max_iterations: int | None = 10,
         tracer: Tracer | None = None,
         parallel_tools: bool = True,
         max_workers: int = 4,
@@ -83,8 +84,8 @@ class Agent:
         tool_timeout: Optional[float] = None,
         tool_output_limit: Optional[int] = None,
     ):
-        if max_iterations < 1:
-            raise ValueError("max_iterations 必须 >= 1")
+        if max_iterations is not None and max_iterations < 1:
+            raise ValueError("max_iterations 必须 >= 1，或 None 表示无上限")
         if max_workers < 1:
             raise ValueError("max_workers 必须 >= 1")
         if response_model is not None and not (
@@ -346,6 +347,15 @@ class Agent:
         return self.response_model.model_validate(extract_json(content))
 
     # ------------------------------------------------------------------
+    def _iter_rounds(self):
+        """循环轮次生成器：max_iterations=None 时无限迭代（由模型自己给出最终
+        回答来结束，或宿主通过 should_stop 中止），否则到上限为止（for-else
+        的 else 分支据此触发「已达上限」兜底）。"""
+        n = 0
+        while self.max_iterations is None or n < self.max_iterations:
+            yield n
+            n += 1
+
     def run(
         self,
         user_input: str,
@@ -374,7 +384,7 @@ class Agent:
         output = None
 
         try:
-            for i in range(self.max_iterations):
+            for i in self._iter_rounds():
                 if should_stop is not None and should_stop():
                     # 非流式中止：返回 stopped 标记（内容为空、不写记忆、不解析）
                     return AgentResult(content="", tool_calls=tool_log,
@@ -489,7 +499,7 @@ class Agent:
         stopped = False
 
         try:
-            for i in range(self.max_iterations):
+            for i in self._iter_rounds():
                 if should_stop is not None and should_stop():
                     stopped = True
                     break
@@ -603,7 +613,7 @@ class Agent:
         output = None
 
         try:
-            for i in range(self.max_iterations):
+            for i in self._iter_rounds():
                 if should_stop is not None and should_stop():
                     return AgentResult(content="", tool_calls=tool_log,
                                        iterations=iterations, usage=usage_total,
@@ -707,7 +717,7 @@ class Agent:
         stopped = False
 
         try:
-            for i in range(self.max_iterations):
+            for i in self._iter_rounds():
                 if should_stop is not None and should_stop():
                     stopped = True
                     break

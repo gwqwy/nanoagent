@@ -83,6 +83,20 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(result.iterations, 3)
         self.assertEqual(len(agent.llm.responses), 0)
 
+    def test_max_iterations_none_runs_until_final_answer(self):
+        """max_iterations=None：无上限——超过默认 10 轮的工具循环不截断，
+        直到模型给出最终回答。"""
+        rounds = 14  # 若有上限（默认 10）这条会在第 10 轮被截断
+        agent = make_agent(
+            [tool_response(f"c{i}", "get_weather", {"city": "北京"}) for i in range(rounds)]
+            + [text_response("任务终于完成了。")],
+            max_iterations=None,
+        )
+        result = agent.run("长任务")
+        self.assertEqual(result.content, "任务终于完成了。")
+        self.assertEqual(result.iterations, rounds + 1)
+        self.assertEqual(len(agent.llm.responses), 0)
+
     def test_memory_records_user_and_final(self):
         memory = Memory()
         agent = make_agent([text_response("回答一")], memory=memory)
