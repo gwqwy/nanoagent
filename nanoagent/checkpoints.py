@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -204,6 +205,9 @@ class PostgresBackend:
             raise ImportError(
                 "Postgres checkpoint 后端需要先安装: pip install nanoagent[postgres]"
             ) from exc
+        # 表名是标识符，不能走参数化：只放行安全字符，防 SQL 标识符注入
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
+            raise ValueError("表名只能包含字母、数字和下划线，且以字母或下划线开头")
         import psycopg
 
         self._psycopg = psycopg
